@@ -13,8 +13,9 @@
       * Draggable, collapsible UI
       * RightShift toggles the menu
 
-    The aura excludes player characters and known friendly NPCs. It uses
-    target-screen click pulses, executor click helpers, or Tool:Activate().
+    The aura excludes player characters and known friendly NPCs. It supports
+    named custom NPC models without Humanoids, recognizes Last Stop's visible
+    Swing prompt, and holds native mouse input while a valid target is in range.
     No guessed RemoteEvent calls or server-side damage edits are included.
 ]]
 
@@ -59,7 +60,7 @@ local state = {
     autoEquipMelee = true,
     auraFace = true,
     auraRange = 16,
-    auraInterval = 0.45,
+    auraInterval = 0.15,
     noClip = false,
     walkSpeed = false,
     walkSpeedValue = 28,
@@ -72,7 +73,13 @@ local markers = {}
 local auraCandidates = {}
 local auraRegistrationPending = {}
 local currentAuraStatus = "Off"
+local currentAuraWeapon = "Not detected"
+local currentAuraTargetName = "--"
+local currentAuraInput = "idle"
+local auraConfirmedHits = 0
+local auraAttackAttempts = 0
 local lastAuraAttack = 0
+local releaseAuraInputCallback = nil
 local noClipCache = {}
 local originalWalkSpeeds = {}
 local visualCache = {}
@@ -203,6 +210,10 @@ local function cleanup()
     end
 
     state.running = false
+
+    if releaseAuraInputCallback then
+        pcall(releaseAuraInputCallback)
+    end
 
     for _, connection in ipairs(connections) do
         pcall(function()
@@ -654,7 +665,7 @@ local function addAttackDelayControl()
         Position = UDim2.new(0, 11, 0, 0),
         Size = UDim2.new(1, -145, 1, 0),
         BackgroundTransparency = 1,
-        Text = "Attack delay",
+        Text = "Fallback click interval",
         TextColor3 = palette.text,
         Font = Enum.Font.GothamSemibold,
         TextSize = 11,
@@ -703,7 +714,7 @@ local function addAttackDelayControl()
     end
 
     track(minus.MouseButton1Click:Connect(function()
-        state.auraInterval = math.max(0.20, math.floor((state.auraInterval - 0.05) * 100 + 0.5) / 100)
+        state.auraInterval = math.max(0.05, math.floor((state.auraInterval - 0.05) * 100 + 0.5) / 100)
         refresh()
     end))
     track(plus.MouseButton1Click:Connect(function()
@@ -794,7 +805,7 @@ addToggle("Distance labels", "distance")
 addDistanceControl()
 
 addSection("Combat")
-addToggle("Zombie / enemy kill aura", "killAura", "Repeated attack taps against detected hostile NPCs")
+addToggle("Zombie / enemy kill aura", "killAura", "Holds the native Swing input against nearby hostile NPCs")
 addToggle("Include bosses", "auraBosses", "Includes Fred, Anubis, Dracula, Crystalus and Juggernaut")
 addToggle("Target unknown NPCs", "auraAllNPCs", "Fallback detection; known friendly NPCs are excluded")
 addToggle("Auto-equip melee", "autoEquipMelee", "Equips an available melee tool when none is equipped")
@@ -844,8 +855,8 @@ make("UICorner", {CornerRadius = UDim.new(0, 7)}, unloadButton)
 -- Small status HUD, separate from the main menu.
 hudFrame = make("Frame", {
     Name = "StatusHUD",
-    Size = UDim2.new(0, 300, 0, 48),
-    Position = UDim2.new(1, -315, 0, 18),
+    Size = UDim2.new(0, 360, 0, 80),
+    Position = UDim2.new(1, -375, 0, 18),
     BackgroundColor3 = palette.background,
     BackgroundTransparency = 0.08,
     BorderSizePixel = 0,
@@ -855,13 +866,13 @@ make("UICorner", {CornerRadius = UDim.new(0, 8)}, hudFrame)
 make("UIStroke", {Color = palette.border, Thickness = 1, Transparency = 0.2}, hudFrame)
 
 hudLabel = make("TextLabel", {
-    Position = UDim2.new(0, 10, 0, 0),
-    Size = UDim2.new(1, -20, 1, 0),
+    Position = UDim2.new(0, 10, 0, 3),
+    Size = UDim2.new(1, -20, 1, -6),
     BackgroundTransparency = 1,
-    Text = "HP --/--  |  Players --\nESP markers: 0",
+    Text = "HP --/--  |  Players --\nESP: 0  |  NPCs: 0  |  Aura: Off\nWeapon: --  |  Target: --\nHP drops: 0  |  Input starts: 0  |  Input: idle",
     TextColor3 = palette.text,
     Font = Enum.Font.GothamSemibold,
-    TextSize = 10,
+    TextSize = 9,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextYAlignment = Enum.TextYAlignment.Center,
 }, hudFrame)
@@ -926,13 +937,17 @@ local zombieWords = {
     "zombie", "undead", "infected", "ghoul", "skeleton", "vampire",
     "crawler", "walker", "bloater", "brute", "bandit", "raider",
     "sniper", "alien", "mutant", "monster", "enemy", "guard", "soldier",
-    "trooper", "hostile"
+    "trooper", "hostile", "mummy", "patient", "werewolf", "wolf",
+    "skeleton king", "zombie dog", "infected human", "mutant human"
 }
 
 local friendlyWords = {
     "shopkeeper", "doctor", "lumberjack", "trader", "merchant", "vendor",
-    "blacksmith", "quest giver", "questgiver"
+    "blacksmith", "quest giver", "questgiver", "survivor", "civilian",
+    "settler", "ally", "friendly"
 }
+
+local npcContainerWords = {"npc", "npcs", "entities", "mob", "mobs"}
 
 local lootWords = {
     "loot", "pickup", "drop", "item", "fuel", "gas can", "gasoline", "wood",
@@ -956,7 +971,7 @@ end
 local function getContextName(instance)
     local names = {string.lower(instance.Name)}
     local parent = instance.Parent
-    for _ = 1, 4 do
+    for _ = 1, 7 do
         if not parent then
             break
         end
@@ -1004,7 +1019,7 @@ local function classify(instance)
         return "loot"
     end
 
-    if instance:IsA("Model") and instance:FindFirstChildOfClass("Humanoid")
+    if instance:IsA("Model") and instance:FindFirstChildWhichIsA("Humanoid", true)
         and hasAny(context, {"npc", "enemy", "hostile"}) then
         return "zombie"
     end
@@ -1077,10 +1092,13 @@ local function getRootPart(instance)
             return instance.PrimaryPart
         end
 
-        local preferred = instance:FindFirstChild("HumanoidRootPart")
-            or instance:FindFirstChild("Torso")
-            or instance:FindFirstChild("UpperTorso")
-            or instance:FindFirstChild("Head")
+        local preferred = instance:FindFirstChild("HumanoidRootPart", true)
+            or instance:FindFirstChild("RootPart", true)
+            or instance:FindFirstChild("Root", true)
+            or instance:FindFirstChild("Hitbox", true)
+            or instance:FindFirstChild("Torso", true)
+            or instance:FindFirstChild("UpperTorso", true)
+            or instance:FindFirstChild("Head", true)
 
         if preferred and preferred:IsA("BasePart") then
             return preferred
@@ -1092,21 +1110,26 @@ local function getRootPart(instance)
     return nil
 end
 
+local meleeWords = {
+    "shovel", "sword", "knife", "axe", "machete", "bat", "spear",
+    "club", "crowbar", "pickaxe", "hammer", "melee", "katana",
+    "scythe", "sledgehammer", "chainsaw", "pipe"
+}
+
 local function isMeleeTool(tool)
     if not tool or not tool:IsA("Tool") then
         return false
     end
 
     local toolName = string.lower(tool.Name)
-    if tool:GetAttribute("IsMelee") == true then
+    local ok, isMelee = pcall(function()
+        return tool:GetAttribute("IsMelee")
+    end)
+    if ok and isMelee == true then
         return true
     end
 
-    return hasAny(toolName, {
-        "shovel", "sword", "knife", "axe", "machete", "bat", "spear",
-        "club", "crowbar", "pickaxe", "hammer", "melee", "katana",
-        "scythe", "sledgehammer", "chainsaw", "pipe"
-    })
+    return hasAny(toolName, meleeWords)
 end
 
 local function getEquippedMeleeTool(character)
@@ -1186,6 +1209,89 @@ local function getBestMeleeTool(character)
     return bestTool
 end
 
+local function findMeleeVisual(character)
+    if not character then
+        return nil
+    end
+
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("Model") or object:IsA("BasePart") then
+            local name = string.lower(object.Name)
+            if hasAny(name, meleeWords) and not object:FindFirstAncestorOfClass("Tool") then
+                return object
+            end
+        end
+    end
+
+    return nil
+end
+
+local swingPromptCache = false
+local swingPromptWeaponCache = nil
+local swingPromptCacheAt = 0
+local function getSwingPromptInfo()
+    if os.clock() - swingPromptCacheAt < 0.4 then
+        return swingPromptCache, swingPromptWeaponCache
+    end
+
+    swingPromptCacheAt = os.clock()
+    swingPromptCache = false
+    swingPromptWeaponCache = nil
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not playerGui then
+        return false, nil
+    end
+
+    for _, object in ipairs(playerGui:GetDescendants()) do
+        if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+            local ok, text = pcall(function()
+                return object.Text
+            end)
+            if ok and type(text) == "string" then
+                local lowerText = string.lower(text)
+                if string.find(lowerText, "swing", 1, true) then
+                    swingPromptCache = true
+                end
+                if not swingPromptWeaponCache then
+                    for _, word in ipairs(meleeWords) do
+                        if string.find(lowerText, word, 1, true) then
+                            swingPromptWeaponCache = string.upper(string.sub(word, 1, 1)) .. string.sub(word, 2)
+                            break
+                        end
+                    end
+                end
+                if swingPromptCache and swingPromptWeaponCache then
+                    break
+                end
+            end
+        end
+    end
+
+    return swingPromptCache, swingPromptWeaponCache
+end
+
+local function getMeleeReady(character)
+    local tool = getEquippedMeleeTool(character)
+    if tool then
+        return true, tool.Name, tool
+    end
+
+    local visual = findMeleeVisual(character)
+    if visual then
+        return true, visual.Name .. " (character model)", nil
+    end
+
+    -- Last Stop exposes its melee action as a live "Swing" prompt. The item
+    -- can be represented by the game's own hotbar system rather than a Tool.
+    local hasPrompt, uiWeaponName = getSwingPromptInfo()
+    if hasPrompt then
+        return true, (uiWeaponName or "Melee") .. " (Swing prompt)", nil
+    end
+
+    return false, "No melee / Swing prompt detected", nil
+end
+
 local mousePress = env.mouse1press
 local mouseRelease = env.mouse1release
 local mouseClick = env.mouse1click
@@ -1210,6 +1316,39 @@ pcall(function()
     virtualInput = game:GetService("VirtualInputManager")
 end)
 
+local attackInputHeld = false
+local attackInputKind = "idle"
+local attackInputPosition = nil
+
+local function releaseAuraInput()
+    if not attackInputHeld then
+        currentAuraInput = "idle"
+        return
+    end
+
+    if attackInputKind == "executor hold" and type(mouseRelease) == "function" then
+        pcall(mouseRelease)
+    elseif attackInputKind == "virtual hold" and virtualInput and attackInputPosition then
+        pcall(function()
+            virtualInput:SendMouseButtonEvent(
+                attackInputPosition.X,
+                attackInputPosition.Y,
+                0,
+                false,
+                game,
+                0
+            )
+        end)
+    end
+
+    attackInputHeld = false
+    attackInputKind = "idle"
+    attackInputPosition = nil
+    currentAuraInput = "idle"
+end
+
+releaseAuraInputCallback = releaseAuraInput
+
 local function isPointerOverToolkit()
     local mousePosition = UserInputService:GetMouseLocation()
 
@@ -1232,51 +1371,64 @@ local function isPointerOverToolkit()
     return false
 end
 
-local function performAuraAttack(tool, targetRoot)
-    if not tool or not targetRoot or isPointerOverToolkit() then
+local function beginAuraAttack(tool, targetRoot)
+    if not targetRoot or isPointerOverToolkit() then
         return false
+    end
+
+    if attackInputHeld then
+        return true
     end
 
     local camera = Workspace.CurrentCamera
     if virtualInput and camera then
         local screenPosition, onScreen = camera:WorldToScreenPoint(targetRoot.Position)
         if onScreen then
-            pcall(function()
-                virtualInput:SendMouseMoveEvent(screenPosition.X, screenPosition.Y, game)
-            end)
-
             local ok = pcall(function()
+                virtualInput:SendMouseMoveEvent(screenPosition.X, screenPosition.Y, game)
                 virtualInput:SendMouseButtonEvent(screenPosition.X, screenPosition.Y, 0, true, game, 0)
-                task.wait(0.04)
-                virtualInput:SendMouseButtonEvent(screenPosition.X, screenPosition.Y, 0, false, game, 0)
             end)
             if ok then
+                attackInputHeld = true
+                attackInputKind = "virtual hold"
+                attackInputPosition = Vector2.new(screenPosition.X, screenPosition.Y)
+                currentAuraInput = "held click"
+                auraAttackAttempts = auraAttackAttempts + 1
                 return true
             end
         end
     end
 
-    local activated = pcall(function()
-        tool:Activate()
-    end)
-    if activated then
-        return true
-    end
-
-    if type(mouseClick) == "function" then
-        local ok = pcall(mouseClick)
+    if type(mousePress) == "function" and type(mouseRelease) == "function" then
+        local ok = pcall(mousePress)
         if ok then
+            attackInputHeld = true
+            attackInputKind = "executor hold"
+            currentAuraInput = "held mouse1"
+            auraAttackAttempts = auraAttackAttempts + 1
             return true
         end
     end
 
-    if type(mousePress) == "function" and type(mouseRelease) == "function" then
+    -- Last-resort compatibility path for executors that expose click-only input.
+    if type(mouseClick) == "function" then
+        local ok = pcall(mouseClick)
+        if ok then
+            currentAuraInput = "click fallback"
+            auraAttackAttempts = auraAttackAttempts + 1
+            lastAuraAttack = os.clock()
+            return true
+        end
+    end
+
+    if tool then
         local ok = pcall(function()
-            mousePress()
-            task.wait(0.04)
-            mouseRelease()
+            tool:Activate()
         end)
         if ok then
+            currentAuraInput = "Tool:Activate fallback"
+            auraAttackAttempts = auraAttackAttempts + 1
+            lastAuraAttack = os.clock()
             return true
         end
     end
@@ -1284,30 +1436,101 @@ local function performAuraAttack(tool, targetRoot)
     return false
 end
 
+local targetHealthValueCache = setmetatable({}, {__mode = "k"})
+local targetHealthScanAt = setmetatable({}, {__mode = "k"})
+
+local function getTargetHealth(model)
+    local humanoid = model:FindFirstChildWhichIsA("Humanoid", true)
+    if humanoid then
+        return humanoid.Health
+    end
+
+    local attributeNames = {"Health", "HP", "CurrentHealth", "CurrentHP", "health", "hp"}
+    for _, key in ipairs(attributeNames) do
+        local ok, value = pcall(function()
+            return model:GetAttribute(key)
+        end)
+        if ok and type(value) == "number" then
+            return value
+        end
+    end
+
+    local cachedValue = targetHealthValueCache[model]
+    if cachedValue and cachedValue.Parent then
+        return cachedValue.Value
+    end
+    if cachedValue == false and os.clock() - (targetHealthScanAt[model] or 0) < 1 then
+        return nil
+    end
+
+    targetHealthScanAt[model] = os.clock()
+    for _, object in ipairs(model:GetDescendants()) do
+        if object:IsA("NumberValue") or object:IsA("IntValue") then
+            local name = string.lower(object.Name)
+            if hasAny(name, {"health", "hp", "currenthealth", "currenthp"}) then
+                targetHealthValueCache[model] = object
+                return object.Value
+            end
+        end
+    end
+
+    targetHealthValueCache[model] = false
+    return nil
+end
+
+local function isTargetDead(model)
+    local deadAttribute = nil
+    pcall(function()
+        deadAttribute = model:GetAttribute("Dead")
+    end)
+    if deadAttribute == true then
+        return true
+    end
+
+    local deadValue = model:FindFirstChild("Dead", true)
+    if deadValue and deadValue:IsA("BoolValue") and deadValue.Value then
+        return true
+    end
+
+    local health = getTargetHealth(model)
+    return health ~= nil and health <= 0
+end
+
 local function findAuraModel(instance)
     local current = instance
+    local hostilePart = nil
 
     while current and current ~= Workspace do
-        if current:IsA("Model") then
-            local humanoid = current:FindFirstChildOfClass("Humanoid")
-            if humanoid and getRootPart(current) then
-                return current
+        if current:IsA("Model") and getRootPart(current) then
+            local context = getContextName(current)
+            if not hasAny(context, friendlyWords) then
+                local kind = classifyAura(current)
+                if kind then
+                    return current
+                end
+
+                local hasHumanoid = current:FindFirstChildWhichIsA("Humanoid", true) ~= nil
+                local isNpcContainer = hasAny(context, npcContainerWords)
+                if hasHumanoid or isNpcContainer or getTargetHealth(current) ~= nil then
+                    return current
+                end
+            end
+        elseif current:IsA("BasePart") then
+            local context = getContextName(current)
+            if hasAny(context, zombieWords) or hasAny(context, bossWords)
+                or hasAny(context, npcContainerWords) then
+                hostilePart = current
             end
         end
         current = current.Parent
     end
 
-    return nil
+    return hostilePart
 end
 
 local function registerAuraCandidate(instance)
     local model = findAuraModel(instance)
     if not model or isPlayerCharacter(model) then
-        return
-    end
-
-    local humanoid = model:FindFirstChildOfClass("Humanoid")
-    if not humanoid then
         return
     end
 
@@ -1317,12 +1540,25 @@ local function registerAuraCandidate(instance)
         return
     end
 
-    auraCandidates[model] = classifyAura(model) or "unknown"
+    local kind = classifyAura(model)
+    if kind then
+        auraCandidates[model] = kind
+        return
+    end
+
+    local hasHumanoid = model:FindFirstChildWhichIsA("Humanoid", true) ~= nil
+    local hasHealth = getTargetHealth(model) ~= nil
+    local isNpcContainer = hasAny(context, npcContainerWords)
+    if hasHumanoid or hasHealth or isNpcContainer then
+        auraCandidates[model] = "unknown"
+    else
+        auraCandidates[model] = nil
+    end
 end
 
 local function queueAuraRegistration(instance)
     local model = findAuraModel(instance)
-    if not model and instance:IsA("Model") then
+    if not model and (instance:IsA("Model") or instance:IsA("BasePart")) then
         model = instance
     end
 
@@ -1349,14 +1585,13 @@ local function getNearestAuraTarget(characterRoot)
         if not model or not model.Parent then
             auraCandidates[model] = nil
         else
-            local humanoid = model:FindFirstChildOfClass("Humanoid")
             local root = getRootPart(model)
             local context = getContextName(model)
 
-            if not humanoid or humanoid.Health <= 0 or isPlayerCharacter(model)
+            if not root or isPlayerCharacter(model) or isTargetDead(model)
                 or hasAny(context, friendlyWords) then
                 auraCandidates[model] = nil
-            elseif root then
+            else
                 local kind = classifyAura(model)
                 if not kind and state.auraAllNPCs then
                     kind = "unknown"
@@ -1530,67 +1765,105 @@ end
 for _, instance in ipairs(Workspace:GetDescendants()) do
     if instance:IsA("Model") then
         registerAuraCandidate(instance)
+    elseif instance:IsA("BasePart") and not instance:FindFirstAncestorOfClass("Model") then
+        registerAuraCandidate(instance)
     end
 end
 
 track(Workspace.DescendantAdded:Connect(queueAuraRegistration))
 track(Workspace.DescendantRemoving:Connect(function(instance)
-    if instance:IsA("Model") then
+    if instance:IsA("Model") or instance:IsA("BasePart") then
         auraCandidates[instance] = nil
         auraRegistrationPending[instance] = nil
     end
 end))
 
 local function runKillAura()
+    local trackedTarget = nil
+    local trackedHealth = nil
+
     while state.running do
         if state.killAura then
             local character = LocalPlayer.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local characterRoot = character and character:FindFirstChild("HumanoidRootPart")
-            local meleeTool = getEquippedMeleeTool(character)
+            local meleeReady, weaponName, meleeTool = getMeleeReady(character)
+
+            currentAuraWeapon = weaponName or "Not detected"
 
             if not humanoid or humanoid.Health <= 0 or not characterRoot then
                 currentAuraStatus = "Waiting for respawn"
+                currentAuraTargetName = "--"
+                releaseAuraInput()
+                trackedTarget = nil
+                trackedHealth = nil
             else
-                if not meleeTool and state.autoEquipMelee then
+                if not meleeReady and state.autoEquipMelee then
                     local bestTool = getBestMeleeTool(character)
                     if bestTool then
                         pcall(function()
                             humanoid:EquipTool(bestTool)
                         end)
                         task.wait(0.12)
-                        meleeTool = getEquippedMeleeTool(character)
+                        meleeReady, weaponName, meleeTool = getMeleeReady(character)
+                        currentAuraWeapon = weaponName or "Not detected"
                     end
                 end
 
-                if not meleeTool then
-                    currentAuraStatus = "Equip or find a melee weapon"
-                else
-                    local target, targetRoot, targetKind, distance = getNearestAuraTarget(characterRoot)
-                    if target and targetRoot then
-                        faceAuraTarget(character, targetRoot)
-                        if os.clock() - lastAuraAttack >= state.auraInterval then
-                            local sent = performAuraAttack(meleeTool, targetRoot)
+                local target, targetRoot, targetKind, distance = getNearestAuraTarget(characterRoot)
+                if target and targetRoot then
+                    currentAuraTargetName = target.Name
+                    faceAuraTarget(character, targetRoot)
+
+                    local healthNow = getTargetHealth(target)
+                    if trackedTarget ~= target then
+                        trackedTarget = target
+                        trackedHealth = healthNow
+                    elseif healthNow ~= nil and trackedHealth ~= nil then
+                        if healthNow < trackedHealth then
+                            auraConfirmedHits = auraConfirmedHits + 1
+                        end
+                        trackedHealth = healthNow
+                    end
+
+                    if meleeReady then
+                        if isPointerOverToolkit() then
+                            releaseAuraInput()
+                            currentAuraStatus = "Move cursor off toolkit"
+                        elseif not attackInputHeld and os.clock() - lastAuraAttack >= state.auraInterval then
+                            local sent = beginAuraAttack(meleeTool, targetRoot)
                             if sent then
                                 lastAuraAttack = os.clock()
-                                currentAuraStatus = string.format("%s: %s (%.0f)", targetKind, target.Name, distance)
+                                currentAuraStatus = string.format("Swinging %s (%.0f)", targetKind, distance)
                             else
-                                currentAuraStatus = "Attack input unavailable"
+                                currentAuraStatus = "Swing input unavailable"
                             end
                         else
-                            currentAuraStatus = string.format("Target: %s (%.0f)", target.Name, distance)
+                            currentAuraStatus = string.format("Holding on %s (%.0f)", target.Name, distance)
                         end
                     else
-                        currentAuraStatus = state.auraAllNPCs and "No NPC in range" or "No recognized hostile in range"
+                        releaseAuraInput()
+                        currentAuraStatus = "No Swing prompt; equip the Shovel"
                     end
+                else
+                    releaseAuraInput()
+                    currentAuraTargetName = "--"
+                    trackedTarget = nil
+                    trackedHealth = nil
+                    currentAuraStatus = state.auraAllNPCs and "No NPC in range" or "No recognized hostile in range"
                 end
             end
         else
+            releaseAuraInput()
             currentAuraStatus = "Off"
+            currentAuraTargetName = "--"
+            currentAuraWeapon = "--"
         end
 
-        task.wait(0.08)
+        task.wait(0.04)
     end
+
+    releaseAuraInput()
 end
 
 task.spawn(runKillAura)
@@ -1681,6 +1954,12 @@ local function scanWorld()
     local count = 0
 
     for _, instance in ipairs(Workspace:GetDescendants()) do
+        if instance:IsA("Model") then
+            registerAuraCandidate(instance)
+        elseif instance:IsA("BasePart") and not instance:FindFirstAncestorOfClass("Model") then
+            registerAuraCandidate(instance)
+        end
+
         if instance:IsA("Model") or instance:IsA("BasePart") or instance:IsA("Tool") then
             local shouldSkip = false
 
@@ -1770,7 +2049,7 @@ local function updateHud()
     end
 
     hudLabel.Text = string.format(
-        "%s  |  Players %d\nESP: %d  |  NPC cache: %d  |  Aura: %s",
+        "%s  |  Players %d\nESP: %d  |  NPCs: %d  |  Aura: %s\nWeapon: %s  |  Target: %s\nHP drops: %d  |  Input starts: %d  |  Input: %s",
         healthText,
         #Players:GetPlayers(),
         lastScanCount,
@@ -1781,7 +2060,12 @@ local function updateHud()
             end
             return count
         end)(),
-        currentAuraStatus
+        currentAuraStatus,
+        currentAuraWeapon,
+        currentAuraTargetName,
+        auraConfirmedHits,
+        auraAttackAttempts,
+        currentAuraInput
     )
 end
 
