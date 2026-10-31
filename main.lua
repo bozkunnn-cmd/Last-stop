@@ -1,13 +1,14 @@
 --[[
-    LAST STOP [BETA] - ROADSIDE TOOLKIT v6
+    LAST STOP [BETA] - ROADSIDE TOOLKIT v7
     Client-side survival toolkit.
 
     Included:
       * Loot / pickup ESP (name + distance)
       * Zombie ESP and boss ESP
       * Teammate ESP (off by default)
-      * 360-degree hostile target acquisition with optional auto-approach
-      * Auto-loot pickup routing and return-to-bus navigation
+      * 360-degree hostile target acquisition without character chasing
+      * Melee swing attempts plus optional firearm aim / auto-shoot with LOS checks
+      * Teleport-assisted loot pickup and return-to-bus navigation
       * Local no-clip and walk-speed controls with restoration on unload
       * Dedicated unload button and local health / player-count / aura HUD
       * Reversible low-effects mode
@@ -16,16 +17,15 @@
 
     The aura excludes player characters and known friendly NPCs. It supports
     named custom NPC models without Humanoids, recognizes Last Stop's visible
-    Swing prompt, and holds native mouse input once within normal melee reach.
-    The aura range is an acquisition/chase radius, not a server-side hitbox edit.
-    Auto-loot uses visible pickup interactions and pathfinding; no guessed remotes.
+    Swing prompt, and sends short targeted click pulses without moving the character.
+    The melee range is target acquisition only; the server still validates damage.
+    Auto-loot uses local character teleports and visible pickup interactions; no guessed remotes.
 ]]
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
-local PathfindingService = game:GetService("PathfindingService")
 local Lighting = game:GetService("Lighting")
 local CollectionService = game:GetService("CollectionService")
 
@@ -66,10 +66,14 @@ local state = {
     autoEquipMelee = true,
     auraFace = true,
     auraAimCamera = true,
-    auraApproach = true,
     auraHitRange = 6.5,
     auraRange = 120,
     auraInterval = 0.02,
+    gunAimAssist = false,
+    gunAutoShoot = false,
+    gunWallCheck = true,
+    gunRange = 180,
+    gunFireInterval = 0.22,
     autoLoot = false,
     autoReturnBus = true,
     lootRange = 80,
@@ -103,8 +107,16 @@ local lootCollectedSinceReturn = 0
 local lootAttempts = 0
 local lootCandidateCount = 0
 local lootLastAttempt = setmetatable({}, {__mode = "k"})
-local lootMovementToken = 0
-local activeAutomationHumanoid = nil
+local lootFailedAttempts = setmetatable({}, {__mode = "k"})
+local lootTeleports = 0
+local gunTargetActive = false
+local gunStatus = "Off"
+local gunTargetName = "--"
+local gunShots = 0
+local gunConfirmedHits = 0
+local gunBlockedShots = 0
+local lastGunShot = 0
+local lastGunBlockedAt = 0
 local combatTargetActive = false
 local primeNoClipCallback = nil
 local characterPartAddedConnection = nil
@@ -240,7 +252,7 @@ local function cleanup()
 
     state.running = false
     combatTargetActive = false
-    lootMovementToken = lootMovementToken + 1
+    gunTargetActive = false
     if characterPartAddedConnection then
         pcall(function() characterPartAddedConnection:Disconnect() end)
         characterPartAddedConnection = nil
@@ -249,13 +261,6 @@ local function cleanup()
         pcall(function() characterPartRemovingConnection:Disconnect() end)
         characterPartRemovingConnection = nil
     end
-    if activeAutomationHumanoid then
-        pcall(function()
-            activeAutomationHumanoid:Move(Vector3.zero, false)
-        end)
-        activeAutomationHumanoid = nil
-    end
-
     if releaseAuraInputCallback then
         pcall(releaseAuraInputCallback)
     end
@@ -396,7 +401,7 @@ make("TextLabel", {
     Position = UDim2.new(0, 14, 0, 27),
     Size = UDim2.new(1, -105, 0, 13),
     BackgroundTransparency = 1,
-    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V6",
+    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V7",
     TextColor3 = palette.muted,
     Font = Enum.Font.Gotham,
     TextSize = 9,
@@ -584,7 +589,7 @@ local function addAuraRangeControl()
         Position = UDim2.new(0, 11, 0, 0),
         Size = UDim2.new(1, -145, 1, 0),
         BackgroundTransparency = 1,
-        Text = "Aura target / chase range",
+        Text = "Aura target acquisition radius",
         TextColor3 = palette.text,
         Font = Enum.Font.GothamSemibold,
         TextSize = 11,
@@ -638,6 +643,79 @@ local function addAuraRangeControl()
     end))
     track(plus.MouseButton1Click:Connect(function()
         state.auraRange = math.min(250, state.auraRange + 5)
+        refresh()
+    end))
+end
+
+local function addGunRangeControl()
+    layoutOrder = layoutOrder + 1
+    local row = make("Frame", {
+        Name = "GunRangeControl",
+        Size = UDim2.new(1, 0, 0, 42),
+        BackgroundColor3 = palette.row,
+        BorderSizePixel = 0,
+        LayoutOrder = layoutOrder,
+    }, content)
+    make("UICorner", {CornerRadius = UDim.new(0, 7)}, row)
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 11, 0, 0),
+        Size = UDim2.new(1, -145, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "Gun target range",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamSemibold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+
+    local valueLabel = make("TextLabel", {
+        Position = UDim2.new(1, -112, 0, 0),
+        Size = UDim2.new(0, 48, 1, 0),
+        BackgroundTransparency = 1,
+        Text = tostring(state.gunRange) .. " studs",
+        TextColor3 = palette.accent,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Center,
+    }, row)
+
+    local minus = make("TextButton", {
+        Position = UDim2.new(1, -62, 0, 8),
+        Size = UDim2.new(0, 24, 0, 26),
+        BackgroundColor3 = palette.panel,
+        BorderSizePixel = 0,
+        Text = "-",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        AutoButtonColor = false,
+    }, row)
+    make("UICorner", {CornerRadius = UDim.new(0, 5)}, minus)
+
+    local plus = make("TextButton", {
+        Position = UDim2.new(1, -32, 0, 8),
+        Size = UDim2.new(0, 24, 0, 26),
+        BackgroundColor3 = palette.panel,
+        BorderSizePixel = 0,
+        Text = "+",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        AutoButtonColor = false,
+    }, row)
+    make("UICorner", {CornerRadius = UDim.new(0, 5)}, plus)
+
+    local function refresh()
+        valueLabel.Text = tostring(state.gunRange) .. " studs"
+    end
+
+    track(minus.MouseButton1Click:Connect(function()
+        state.gunRange = math.max(25, state.gunRange - 25)
+        refresh()
+    end))
+    track(plus.MouseButton1Click:Connect(function()
+        state.gunRange = math.min(300, state.gunRange + 25)
         refresh()
     end))
 end
@@ -1016,19 +1094,21 @@ addToggle("Distance labels", "distance")
 addDistanceControl()
 
 addSection("Combat")
-addToggle("Zombie / enemy kill aura", "killAura", "Holds the native Swing input against nearby hostile NPCs")
+addToggle("Zombie / enemy kill aura", "killAura", "Clicks at hostile targets without moving your character; server still validates melee range")
 addToggle("Include bosses", "auraBosses", "Includes Fred, Anubis, Dracula, Crystalus and Juggernaut")
 addToggle("Target unknown NPCs", "auraAllNPCs", "Fallback detection; known friendly NPCs are excluded")
 addToggle("Auto-equip melee", "autoEquipMelee", "Equips an available melee tool when none is equipped")
 addToggle("Auto-face target", "auraFace", "Turns your character toward the nearest valid target")
 addToggle("Aim camera at target", "auraAimCamera", "Turns the view toward targets outside your current aim")
-addToggle("Auto-approach targets", "auraApproach", "Moves into melee reach; range is target acquisition, not hitbox reach")
+addToggle("Gun auto-aim", "gunAimAssist", "Aims at the nearest visible hostile while a firearm is equipped")
+addToggle("Gun auto-shoot", "gunAutoShoot", "Fires only when a raycast confirms a clear line to the target")
+addGunRangeControl()
 addAuraRangeControl()
 addAttackDelayControl()
 
 addSection("Automation")
-addToggle("Auto loot nearby items", "autoLoot", "Walks to eligible pickups and collects them")
-addToggle("Return to bus when done", "autoReturnBus", "Returns after a loot sweep or when the tool-count threshold is reached")
+addToggle("Auto loot nearby items", "autoLoot", "Teleports to eligible pickups, interacts, then returns to the bus")
+addToggle("Return to bus when done", "autoReturnBus", "Teleports back after a loot sweep or inventory threshold; storage may need manual unload")
 addLootRangeControl()
 addLootReturnThresholdControl()
 
@@ -1074,8 +1154,8 @@ make("UICorner", {CornerRadius = UDim.new(0, 7)}, unloadButton)
 -- Small status HUD, separate from the main menu.
 hudFrame = make("Frame", {
     Name = "StatusHUD",
-    Size = UDim2.new(0, 410, 0, 112),
-    Position = UDim2.new(1, -425, 0, 18),
+    Size = UDim2.new(0, 430, 0, 140),
+    Position = UDim2.new(1, -445, 0, 18),
     BackgroundColor3 = palette.background,
     BackgroundTransparency = 0.08,
     BorderSizePixel = 0,
@@ -1088,7 +1168,7 @@ hudLabel = make("TextLabel", {
     Position = UDim2.new(0, 10, 0, 3),
     Size = UDim2.new(1, -20, 1, -6),
     BackgroundTransparency = 1,
-    Text = "HP --/--  |  Players --\nESP: 0  |  NPCs: 0  |  Aura: Off\nWeapon: --  |  Target: --\nHits: 0  |  Inputs: 0  |  Loot: Off\nLooted: 0  |  Attempts: 0  |  Target: --",
+    Text = "HP --/--  |  Players --\nESP: 0  |  NPCs: 0  |  Melee: Off\nGun: Off  |  Shots: 0  |  Blocked: 0\nLoot: Off  |  Looted: 0  |  Teleports: 0\nAttempts: 0  |  Target: --  |  Candidates: 0",
     TextColor3 = palette.text,
     Font = Enum.Font.GothamSemibold,
     TextSize = 9,
@@ -1606,54 +1686,59 @@ local function isPointerOverToolkit()
 end
 
 local function beginAuraAttack(tool, targetRoot)
-    if not targetRoot or isPointerOverToolkit() then
+    if not targetRoot or not targetRoot.Parent or isPointerOverToolkit() then
         return false
-    end
-
-    if attackInputHeld then
-        return true
     end
 
     local camera = Workspace.CurrentCamera
     if virtualInput and camera then
-        local screenPosition, onScreen = camera:WorldToScreenPoint(targetRoot.Position)
-        if onScreen and isScreenPointOverToolkit(screenPosition.X, screenPosition.Y) then
+        local point, onScreen = camera:WorldToScreenPoint(targetRoot.Position)
+        if not onScreen or isScreenPointOverToolkit(point.X, point.Y) then
             return false
         end
-        if onScreen then
-            local ok = pcall(function()
-                virtualInput:SendMouseMoveEvent(screenPosition.X, screenPosition.Y, game)
-                virtualInput:SendMouseButtonEvent(screenPosition.X, screenPosition.Y, 0, true, game, 0)
+
+        local previousMouse = nil
+        pcall(function()
+            previousMouse = UserInputService:GetMouseLocation()
+        end)
+
+        local downOk = pcall(function()
+            virtualInput:SendMouseMoveEvent(point.X, point.Y, game)
+            virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
+        end)
+        if not downOk then
+            return false
+        end
+
+        task.wait(0.025)
+        local upOk = pcall(function()
+            virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
+        end)
+        if not upOk then
+            pcall(function()
+                virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
             end)
-            if ok then
-                attackInputHeld = true
-                attackInputKind = "virtual hold"
-                attackInputPosition = Vector2.new(screenPosition.X, screenPosition.Y)
-                currentAuraInput = "held click"
-                auraAttackAttempts = auraAttackAttempts + 1
-                return true
-            end
+            return false
         end
+        if previousMouse then
+            pcall(function()
+                virtualInput:SendMouseMoveEvent(previousMouse.X, previousMouse.Y, game)
+            end)
+        end
+
+        attackInputHeld = false
+        attackInputKind = "idle"
+        attackInputPosition = nil
+        currentAuraInput = "click pulse"
+        auraAttackAttempts = auraAttackAttempts + 1
+        return true
     end
 
-    if type(mousePress) == "function" and type(mouseRelease) == "function" then
-        local ok = pcall(mousePress)
-        if ok then
-            attackInputHeld = true
-            attackInputKind = "executor hold"
-            currentAuraInput = "held mouse1"
-            auraAttackAttempts = auraAttackAttempts + 1
-            return true
-        end
-    end
-
-    -- Last-resort compatibility path for executors that expose click-only input.
     if type(mouseClick) == "function" then
         local ok = pcall(mouseClick)
         if ok then
-            currentAuraInput = "click fallback"
+            currentAuraInput = "executor click"
             auraAttackAttempts = auraAttackAttempts + 1
-            lastAuraAttack = os.clock()
             return true
         end
     end
@@ -1665,7 +1750,6 @@ local function beginAuraAttack(tool, targetRoot)
         if ok then
             currentAuraInput = "Tool:Activate fallback"
             auraAttackAttempts = auraAttackAttempts + 1
-            lastAuraAttack = os.clock()
             return true
         end
     end
@@ -1673,29 +1757,6 @@ local function beginAuraAttack(tool, targetRoot)
     return false
 end
 
-local function updateHeldAuraAim(targetRoot)
-    if not attackInputHeld or attackInputKind ~= "virtual hold" or not virtualInput or not targetRoot then
-        return
-    end
-
-    local camera = Workspace.CurrentCamera
-    if not camera then
-        return
-    end
-
-    local point, onScreen = camera:WorldToScreenPoint(targetRoot.Position)
-    if not onScreen or isScreenPointOverToolkit(point.X, point.Y) then
-        releaseAuraInput()
-        return
-    end
-
-    local ok = pcall(function()
-        virtualInput:SendMouseMoveEvent(point.X, point.Y, game)
-    end)
-    if ok then
-        attackInputPosition = Vector2.new(point.X, point.Y)
-    end
-end
 
 local targetHealthValueCache = setmetatable({}, {__mode = "k"})
 local targetHealthScanAt = setmetatable({}, {__mode = "k"})
@@ -1740,17 +1801,52 @@ local function getTargetHealth(model)
 end
 
 local function isTargetDead(model)
-    local deadAttribute = nil
-    pcall(function()
-        deadAttribute = model:GetAttribute("Dead")
-    end)
-    if deadAttribute == true then
+    if not model or not model.Parent then
         return true
     end
 
-    local deadValue = model:FindFirstChild("Dead", true)
-    if deadValue and deadValue:IsA("BoolValue") and deadValue.Value then
+    local context = getContextName(model)
+    if hasAny(context, {"corpse", "ragdoll", "dead body", "deadbody", "zombie corpse"}) then
         return true
+    end
+
+    for _, attributeName in ipairs({"Dead", "IsDead", "Alive", "IsAlive"}) do
+        local ok, value = pcall(function()
+            return model:GetAttribute(attributeName)
+        end)
+        if ok then
+            if (attributeName == "Dead" or attributeName == "IsDead") and value == true then
+                return true
+            end
+            if (attributeName == "Alive" or attributeName == "IsAlive") and value == false then
+                return true
+            end
+        end
+    end
+
+    for _, valueName in ipairs({"Dead", "IsDead", "Alive", "IsAlive"}) do
+        local valueObject = model:FindFirstChild(valueName, true)
+        if valueObject and valueObject:IsA("BoolValue") then
+            if (valueName == "Dead" or valueName == "IsDead") and valueObject.Value then
+                return true
+            end
+            if (valueName == "Alive" or valueName == "IsAlive") and not valueObject.Value then
+                return true
+            end
+        end
+    end
+
+    local humanoid = model:FindFirstChildWhichIsA("Humanoid", true)
+    if humanoid then
+        if humanoid.Health <= 0 then
+            return true
+        end
+        local ok, humanoidState = pcall(function()
+            return humanoid:GetState()
+        end)
+        if ok and humanoidState == Enum.HumanoidStateType.Dead then
+            return true
+        end
     end
 
     local health = getTargetHealth(model)
@@ -2069,18 +2165,25 @@ end))
 local function runKillAura()
     local trackedTarget = nil
     local trackedHealth = nil
-    local approachTarget = nil
-    local lastApproachMove = 0
     local lastEquipAttempt = 0
 
     while state.running do
         local stepOk, stepError = pcall(function()
-        if state.killAura then
+            if not state.killAura then
+                combatTargetActive = false
+                releaseAuraInput()
+                currentAuraStatus = "Off"
+                currentAuraTargetName = "--"
+                currentAuraWeapon = "--"
+                trackedTarget = nil
+                trackedHealth = nil
+                return
+            end
+
             local character = LocalPlayer.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local characterRoot = character and character:FindFirstChild("HumanoidRootPart")
             local meleeReady, weaponName, meleeTool = getMeleeReady(character)
-
             currentAuraWeapon = weaponName or "Not detected"
 
             if not humanoid or humanoid.Health <= 0 or not characterRoot then
@@ -2090,146 +2193,95 @@ local function runKillAura()
                 releaseAuraInput()
                 trackedTarget = nil
                 trackedHealth = nil
-            else
-                if state.autoEquipMelee and os.clock() - lastEquipAttempt >= 0.75 then
-                    local equippedTool = getEquippedMeleeTool(character)
-                    if not equippedTool and not getCachedMeleeVisual(character) then
-                        lastEquipAttempt = os.clock()
-                        local bestTool = getBestMeleeTool(character)
-                        if bestTool and bestTool.Parent ~= character then
-                            pcall(function()
-                                humanoid:EquipTool(bestTool)
-                            end)
-                            task.wait(0.12)
-                            meleeReady, weaponName, meleeTool = getMeleeReady(character)
-                            currentAuraWeapon = weaponName or "Not detected"
-                        end
+                return
+            end
+
+            if state.autoEquipMelee and os.clock() - lastEquipAttempt >= 0.75 then
+                local equippedTool = getEquippedMeleeTool(character)
+                if not equippedTool and not getCachedMeleeVisual(character) then
+                    lastEquipAttempt = os.clock()
+                    local bestTool = getBestMeleeTool(character)
+                    if bestTool and bestTool.Parent ~= character then
+                        pcall(function()
+                            humanoid:EquipTool(bestTool)
+                        end)
+                        task.wait(0.12)
+                        meleeReady, weaponName, meleeTool = getMeleeReady(character)
+                        currentAuraWeapon = weaponName or "Not detected"
                     end
                 end
+            end
 
-                local target, targetRoot, targetKind, distance = getNearestAuraTarget(characterRoot)
-                if target and targetRoot then
-                    combatTargetActive = true
-                    currentAuraTargetName = target.Name
-                    local targetDistance = (targetRoot.Position - characterRoot.Position).Magnitude
-                    if activeAutomationHumanoid == humanoid then
-                        lootMovementToken = lootMovementToken + 1
-                        if not state.auraApproach or targetDistance <= state.auraHitRange then
-                            pcall(function()
-                                humanoid:MoveTo(characterRoot.Position)
-                            end)
-                        end
-                        activeAutomationHumanoid = nil
-                    end
-                    faceAuraTarget(character, targetRoot)
-                    aimAuraCamera(targetRoot)
-                    updateHeldAuraAim(targetRoot)
+            local target, targetRoot, targetKind, distance = getNearestAuraTarget(characterRoot)
+            if not target or not targetRoot then
+                combatTargetActive = false
+                releaseAuraInput()
+                currentAuraTargetName = "--"
+                trackedTarget = nil
+                trackedHealth = nil
+                currentAuraStatus = state.auraAllNPCs and "No NPC in range" or "No recognized hostile in range"
+                return
+            end
 
-                    if trackedTarget ~= target then
-                        releaseAuraInput()
-                        end
+            combatTargetActive = true
+            currentAuraTargetName = target.Name
 
-                    local healthNow = getTargetHealth(target)
-                    if trackedTarget ~= target then
-                        trackedTarget = target
-                        trackedHealth = healthNow
-                    elseif healthNow ~= nil and trackedHealth ~= nil then
-                        if healthNow < trackedHealth then
-                            auraConfirmedHits = auraConfirmedHits + 1
-                        end
-                        trackedHealth = healthNow
-                    end
+            if isTargetDead(target) then
+                auraCandidates[target] = nil
+                releaseAuraInput()
+                trackedTarget = nil
+                trackedHealth = nil
+                currentAuraStatus = "Target eliminated"
+                return
+            end
 
-                    if distance > state.auraHitRange and state.auraApproach then
-                        releaseAuraInput()
-                        currentAuraInput = "approaching"
-                        currentAuraStatus = string.format("Chasing %s (%.0f / %.0f)", target.Name, distance, state.auraRange)
-                        if not humanoid.SeatPart and (approachTarget ~= target or os.clock() - lastApproachMove >= 0.25) then
-                            pcall(function()
-                                humanoid:MoveTo(targetRoot.Position)
-                            end)
-                            approachTarget = target
-                            lastApproachMove = os.clock()
-                        end
-                    elseif distance > state.auraHitRange then
-                        releaseAuraInput()
-                        if approachTarget then
-                            pcall(function()
-                                humanoid:MoveTo(characterRoot.Position)
-                            end)
-                            approachTarget = nil
-                        end
-                        currentAuraStatus = string.format("Out of melee reach (%.1f studs)", distance)
-                    elseif meleeReady then
-                            if approachTarget then
-                            pcall(function()
-                                humanoid:MoveTo(characterRoot.Position)
-                            end)
-                            approachTarget = nil
-                        end
-                        if isPointerOverToolkit() then
-                            releaseAuraInput()
-                            currentAuraStatus = "Move cursor off toolkit"
-                        elseif not attackInputHeld and os.clock() - lastAuraAttack >= state.auraInterval then
-                            local sent = beginAuraAttack(meleeTool, targetRoot)
-                            if sent then
-                                lastAuraAttack = os.clock()
-                                currentAuraStatus = string.format("Swinging %s (%.1f studs)", targetKind, distance)
-                            else
-                                currentAuraStatus = "Swing input unavailable"
-                            end
-                        else
-                            currentAuraStatus = string.format("Holding on %s (%.1f studs)", target.Name, distance)
-                        end
+            local healthNow = getTargetHealth(target)
+            if trackedTarget ~= target then
+                releaseAuraInput()
+                trackedTarget = target
+                trackedHealth = healthNow
+            elseif healthNow ~= nil and trackedHealth ~= nil then
+                if healthNow < trackedHealth then
+                    auraConfirmedHits = auraConfirmedHits + 1
+                end
+                trackedHealth = healthNow
+            end
+
+            if not meleeReady then
+                releaseAuraInput()
+                currentAuraStatus = "No melee weapon / Swing prompt"
+                return
+            end
+
+            -- Facing and camera aiming are allowed; character translation is never issued here.
+            faceAuraTarget(character, targetRoot)
+            aimAuraCamera(targetRoot)
+
+            if isPointerOverToolkit() then
+                releaseAuraInput()
+                currentAuraStatus = "Move cursor off toolkit"
+            elseif os.clock() - lastAuraAttack >= state.auraInterval then
+                local sent = beginAuraAttack(meleeTool, targetRoot)
+                if sent then
+                    lastAuraAttack = os.clock()
+                    if distance > state.auraHitRange then
+                        currentAuraStatus = string.format(
+                            "Long-range swing attempt: %.0f studs (server may reject)", distance
+                        )
                     else
-                        releaseAuraInput()
-                        currentAuraStatus = "No Swing prompt; equip the Shovel"
+                        currentAuraStatus = string.format("Swinging %s (%.1f studs)", targetKind, distance)
                     end
                 else
-                    combatTargetActive = false
-                    releaseAuraInput()
-                    if approachTarget then
-                        pcall(function()
-                            humanoid:MoveTo(characterRoot.Position)
-                        end)
-                        approachTarget = nil
-                    end
-                    currentAuraTargetName = "--"
-                    trackedTarget = nil
-                    trackedHealth = nil
-                    currentAuraStatus = state.auraAllNPCs and "No NPC in range" or "No recognized hostile in range"
+                    currentAuraStatus = "Target not on screen / input unavailable"
                 end
+            else
+                currentAuraStatus = string.format("Targeting %s (%.1f studs)", target.Name, distance)
             end
-        else
-            combatTargetActive = false
-            releaseAuraInput()
-            if approachTarget then
-                local character = LocalPlayer.Character
-                local root = character and character:FindFirstChild("HumanoidRootPart")
-                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-                if humanoid and root then
-                    pcall(function()
-                        humanoid:MoveTo(root.Position)
-                    end)
-                end
-                approachTarget = nil
-            end
-            currentAuraStatus = "Off"
-            currentAuraTargetName = "--"
-            currentAuraWeapon = "--"
-        end
-
         end)
+
         if not stepOk then
             releaseAuraInput()
             combatTargetActive = false
-            local character = LocalPlayer.Character
-            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-            local root = character and character:FindFirstChild("HumanoidRootPart")
-            if humanoid and root then
-                pcall(function() humanoid:MoveTo(root.Position) end)
-            end
-            approachTarget = nil
             currentAuraStatus = "Aura error: " .. tostring(stepError):sub(1, 45)
         end
         task.wait(0.04)
@@ -2239,6 +2291,333 @@ local function runKillAura()
 end
 
 task.spawn(runKillAura)
+
+
+-- Firearm assist: uses the game's normal click-to-shoot input and refuses to fire
+-- unless a raycast reaches the selected hostile model before hitting scenery.
+local gunNameWords = {
+    "revolver", "shotgun", "rifle", "pistol", "sniper", "smg",
+    "submachine", "carbine", "musket", "firearm", "crossbow", "handgun",
+    "double barrel", "blunderbuss", "machine gun", "flamethrower",
+    "ak47", "ak-47", "m4", "m16", "mp5", "uzi", "deagle", "desert eagle", "gun"
+}
+
+local function isGunTool(tool)
+    if not tool or not tool:IsA("Tool") then
+        return false
+    end
+
+    local okType, weaponType = pcall(function()
+        return tool:GetAttribute("WeaponType")
+    end)
+    if okType and type(weaponType) == "string" then
+        local lowered = string.lower(weaponType)
+        if string.find(lowered, "ranged", 1, true) or string.find(lowered, "gun", 1, true) then
+            return true
+        end
+    end
+
+    local okGun, isGun = pcall(function()
+        return tool:GetAttribute("IsGun") or tool:GetAttribute("IsRanged")
+    end)
+    if okGun and isGun == true then
+        return true
+    end
+
+    local name = string.lower(tool.Name)
+    if hasAny(name, gunNameWords) then
+        return true
+    end
+
+    return false
+end
+
+local function getEquippedGun(character)
+    if not character then
+        return nil
+    end
+    for _, child in ipairs(character:GetChildren()) do
+        if isGunTool(child) then
+            return child
+        end
+    end
+
+    -- Some custom hotbar systems render the held firearm as a character model
+    -- instead of parenting a Roblox Tool directly to the character.
+    for _, object in ipairs(character:GetDescendants()) do
+        if (object:IsA("Model") or object:IsA("BasePart"))
+            and hasAny(string.lower(object.Name), gunNameWords)
+            and not object:FindFirstAncestorOfClass("Tool") then
+            return object
+        end
+    end
+    return nil
+end
+
+local function getGunAimPart(model)
+    local head = model and model:FindFirstChild("Head", true)
+    if head and head:IsA("BasePart") then
+        return head
+    end
+    return getRootPart(model)
+end
+
+local function hasGunLineOfSight(character, target, aimPart)
+    local camera = Workspace.CurrentCamera
+    if not camera or not target or not aimPart then
+        return false
+    end
+
+    local origin = camera.CFrame.Position
+    local direction = aimPart.Position - origin
+    if direction.Magnitude <= 0.1 then
+        return false
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character}
+    params.IgnoreWater = true
+
+    local result = Workspace:Raycast(origin, direction, params)
+    return result ~= nil and result.Instance ~= nil and result.Instance:IsDescendantOf(target)
+end
+
+local function findVisibleGunAimPart(character, target)
+    local names = {"Head", "UpperTorso", "Torso", "HumanoidRootPart", "RootPart", "Root"}
+    for _, partName in ipairs(names) do
+        local part = target:FindFirstChild(partName, true)
+        if part and part:IsA("BasePart") and hasGunLineOfSight(character, target, part) then
+            return part
+        end
+    end
+
+    local root = getRootPart(target)
+    if root and hasGunLineOfSight(character, target, root) then
+        return root
+    end
+    return nil
+end
+
+local function findNearestGunTarget(character, characterRoot)
+    local bestModel = nil
+    local bestPart = nil
+    local bestDistance = state.gunRange
+    local blockedModel = nil
+    local blockedDistance = state.gunRange
+
+    for model, kind in pairs(auraCandidates) do
+        if not model or not model.Parent then
+            auraCandidates[model] = nil
+        elseif not isPlayerCharacter(model) and not isTargetDead(model) then
+            local context = getContextName(model)
+            if not hasAny(context, friendlyWords) then
+                if kind == "unknown" or not kind then
+                    kind = classifyAura(model)
+                    if not kind and state.auraAllNPCs then
+                        kind = "unknown"
+                    end
+                end
+
+                local allowed = kind == "zombie"
+                    or (kind == "boss" and state.auraBosses)
+                    or (kind == "unknown" and state.auraAllNPCs)
+
+                if allowed then
+                    local root = getRootPart(model)
+                    if root then
+                        local distance = (root.Position - characterRoot.Position).Magnitude
+                        if distance <= state.gunRange then
+                            local aimPart = nil
+                            if state.gunWallCheck then
+                                aimPart = findVisibleGunAimPart(character, model)
+                            else
+                                aimPart = getGunAimPart(model) or root
+                            end
+
+                            if aimPart then
+                                if distance < bestDistance then
+                                    bestModel = model
+                                    bestPart = aimPart
+                                    bestDistance = distance
+                                end
+                            elseif state.gunWallCheck and distance < blockedDistance then
+                                blockedModel = model
+                                blockedDistance = distance
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestModel, bestPart, bestDistance, blockedModel
+end
+
+local function aimGunAt(targetPart)
+    local camera = Workspace.CurrentCamera
+    if not camera or not targetPart then
+        return false
+    end
+
+    local cameraPosition = camera.CFrame.Position
+    local direction = targetPart.Position - cameraPosition
+    if direction.Magnitude <= 0.1 then
+        return false
+    end
+
+    local ok = pcall(function()
+        local desired = CFrame.lookAt(cameraPosition, targetPart.Position, camera.CFrame.UpVector)
+        camera.CFrame = camera.CFrame:Lerp(desired, 0.55)
+    end)
+    return ok
+end
+
+local function fireGunClick(targetPart)
+    local camera = Workspace.CurrentCamera
+    if not camera or not targetPart or not virtualInput then
+        return false
+    end
+
+    local point, onScreen = camera:WorldToScreenPoint(targetPart.Position)
+    if not onScreen or isScreenPointOverToolkit(point.X, point.Y) then
+        return false
+    end
+
+    local previousMouse = nil
+    pcall(function()
+        previousMouse = UserInputService:GetMouseLocation()
+    end)
+
+    local downOk = pcall(function()
+        virtualInput:SendMouseMoveEvent(point.X, point.Y, game)
+        virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
+    end)
+    if not downOk then
+        return false
+    end
+
+    task.wait(0.025)
+    local upOk = pcall(function()
+        virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
+    end)
+    if not upOk then
+        pcall(function()
+            virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
+        end)
+        return false
+    end
+    if previousMouse then
+        pcall(function()
+            virtualInput:SendMouseMoveEvent(previousMouse.X, previousMouse.Y, game)
+        end)
+    end
+
+    return true
+end
+
+local function runGunAssist()
+    local trackedGunTarget = nil
+    local trackedGunHealth = nil
+
+    while state.running do
+        local ok, err = pcall(function()
+            gunTargetActive = false
+            if not state.gunAimAssist and not state.gunAutoShoot then
+                gunStatus = "Off"
+                gunTargetName = "--"
+                trackedGunTarget = nil
+                trackedGunHealth = nil
+                return
+            end
+
+            local character = LocalPlayer.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local characterRoot = character and character:FindFirstChild("HumanoidRootPart")
+            local gun = getEquippedGun(character)
+
+            if not humanoid or humanoid.Health <= 0 or not characterRoot then
+                gunStatus = "Waiting for respawn"
+                gunTargetName = "--"
+                return
+            end
+            if not gun then
+                gunStatus = "Equip a firearm"
+                gunTargetName = "--"
+                return
+            end
+
+            local target, aimPart, distance, blocked = findNearestGunTarget(character, characterRoot)
+            if not target or not aimPart then
+                trackedGunTarget = nil
+                trackedGunHealth = nil
+                if blocked then
+                    gunTargetName = blocked.Name
+                    gunStatus = "Blocked by wall: " .. blocked.Name
+                    if os.clock() - lastGunBlockedAt >= 0.5 then
+                        gunBlockedShots = gunBlockedShots + 1
+                        lastGunBlockedAt = os.clock()
+                    end
+                else
+                    gunTargetName = "--"
+                    gunStatus = "No visible hostile in range"
+                end
+                return
+            end
+
+            gunTargetActive = state.gunAimAssist or state.gunAutoShoot
+            gunTargetName = target.Name
+            local targetHealth = getTargetHealth(target)
+            if trackedGunTarget ~= target then
+                trackedGunTarget = target
+                trackedGunHealth = targetHealth
+            elseif targetHealth ~= nil and trackedGunHealth ~= nil then
+                if targetHealth < trackedGunHealth then
+                    gunConfirmedHits = gunConfirmedHits + 1
+                end
+                trackedGunHealth = targetHealth
+            end
+
+            if state.gunAimAssist or state.gunAutoShoot then
+                aimGunAt(aimPart)
+            end
+
+            -- Re-check after aiming so an intervening wall never receives a shot.
+            if state.gunAutoShoot then
+                if state.gunWallCheck and not hasGunLineOfSight(character, target, aimPart) then
+                    gunStatus = "Shot blocked: line of sight lost"
+                    if os.clock() - lastGunBlockedAt >= 0.5 then
+                        gunBlockedShots = gunBlockedShots + 1
+                        lastGunBlockedAt = os.clock()
+                    end
+                elseif os.clock() - lastGunShot >= state.gunFireInterval then
+                    local fired = fireGunClick(aimPart)
+                    if fired then
+                        lastGunShot = os.clock()
+                        gunShots = gunShots + 1
+                        gunStatus = string.format("Sent shot input to %s (%.0f studs)", target.Name, distance)
+                    else
+                        gunStatus = "Aim ready; click input unavailable"
+                    end
+                else
+                    gunStatus = string.format("Aiming at %s (%.0f studs)", target.Name, distance)
+                end
+            else
+                gunStatus = string.format("Aiming at %s (%.0f studs)", target.Name, distance)
+            end
+        end)
+
+        if not ok then
+            gunTargetActive = false
+            gunStatus = "Gun assist error: " .. tostring(err):sub(1, 42)
+        end
+        task.wait(0.05)
+    end
+    gunTargetActive = false
+end
+
+task.spawn(runGunAssist)
 
 -- Auto-loot uses the game's visible pickup interactions (prompts, click detectors,
 -- or the documented click-to-grab action). It does not guess or invoke game remotes.
@@ -2510,6 +2889,9 @@ local function findNearestLoot(origin, maxDistance)
         elseif isPlayerInventoryObject(candidate) then
             lootCandidates[candidate] = nil
             lootInteractionCache[candidate] = nil
+        elseif (lootFailedAttempts[candidate] or 0) >= 2 then
+            lootCandidates[candidate] = nil
+            lootInteractionCache[candidate] = nil
         else
             local root = getRootPart(candidate)
             if root and root.Parent then
@@ -2632,87 +3014,48 @@ local function getBusReturnPosition(bus, busRoot, seat)
     return anchor.Position + anchor.CFrame.RightVector * 6 + Vector3.new(0, 1.5, 0)
 end
 
-local function moveAutomationTo(humanoid, root, destination, token, requireBusReturn, arrivalDistance)
-    if not humanoid or not root or not destination then
+local function teleportRootTo(root, destination, lookAtPosition)
+    if not root or not root.Parent or typeof(destination) ~= "Vector3" then
         return false
     end
 
-    arrivalDistance = math.max(3, arrivalDistance or 7)
-    activeAutomationHumanoid = humanoid
-    local pathOk, path = pcall(function()
-        return PathfindingService:CreatePath({
-            AgentRadius = 2,
-            AgentHeight = 5,
-            AgentCanJump = true,
-            AgentCanClimb = true,
-            WaypointSpacing = 5,
-        })
+    local lookPosition = lookAtPosition
+    if not lookPosition or (lookPosition - destination).Magnitude < 0.1 then
+        lookPosition = destination + root.CFrame.LookVector
+    end
+
+    local ok = pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = CFrame.lookAt(destination, lookPosition)
     end)
-
-    local computed = false
-    if pathOk and path then
-        computed = pcall(function()
-            path:ComputeAsync(root.Position, destination)
-        end)
+    if not ok then
+        return false
     end
 
-    if computed and pathOk and path and path.Status == Enum.PathStatus.Success then
-        for _, waypoint in ipairs(path:GetWaypoints()) do
-            if not state.running or not state.autoLoot or token ~= lootMovementToken
-                or (requireBusReturn and not state.autoReturnBus)
-                or (state.killAura and combatTargetActive) then
-                return false
-            end
-            if (root.Position - destination).Magnitude <= arrivalDistance then
-                return true
-            end
-            if waypoint.Action == Enum.PathWaypointAction.Jump then
-                humanoid.Jump = true
-            end
+    task.wait(0.14)
+    return root.Parent ~= nil and (root.Position - destination).Magnitude <= 10
+end
 
-            local finished = false
-            local reached = false
-            local connection = humanoid.MoveToFinished:Connect(function(success)
-                finished = true
-                reached = success
-            end)
-            humanoid:MoveTo(waypoint.Position)
-            local deadline = os.clock() + 4
-            while state.running and state.autoLoot and token == lootMovementToken
-                and not (requireBusReturn and not state.autoReturnBus)
-                and not (state.killAura and combatTargetActive)
-                and not finished and os.clock() < deadline do
-                task.wait(0.05)
-            end
-            connection:Disconnect()
-            if not finished or not reached then
-                break
-            end
-        end
-
-        if (root.Position - destination).Magnitude <= arrivalDistance then
-            return true
-        end
+local function teleportNearLoot(root, targetRoot, pickupRange)
+    if not root or not targetRoot then
+        return false
     end
 
-    -- Fallback for simple open areas or games whose navmesh does not include the pickup.
-    if state.running and state.autoLoot and token == lootMovementToken
-        and not (requireBusReturn and not state.autoReturnBus)
-        and not (state.killAura and combatTargetActive) then
-        humanoid:MoveTo(destination)
-        local deadline = os.clock() + 7
-        while state.running and state.autoLoot and token == lootMovementToken
-            and not (requireBusReturn and not state.autoReturnBus)
-            and not (state.killAura and combatTargetActive)
-            and os.clock() < deadline do
-            if (root.Position - destination).Magnitude <= arrivalDistance then
-                return true
-            end
-            task.wait(0.1)
-        end
+    local away = root.Position - targetRoot.Position
+    away = Vector3.new(away.X, 0, away.Z)
+    if away.Magnitude < 0.1 then
+        local right = targetRoot.CFrame.RightVector
+        away = Vector3.new(right.X, 0, right.Z)
+    end
+    if away.Magnitude < 0.1 then
+        away = Vector3.new(1, 0, 0)
     end
 
-    return (root.Position - destination).Magnitude <= arrivalDistance
+    local offset = math.max(0.55, math.min(2.5, pickupRange * 0.35))
+    local height = math.max(0.65, math.min(2.0, pickupRange * 0.45))
+    local destination = targetRoot.Position + away.Unit * offset + Vector3.new(0, height, 0)
+    return teleportRootTo(root, destination, targetRoot.Position)
 end
 
 local function aimLootCamera(root)
@@ -2738,6 +3081,11 @@ local function clickWorldObject(root)
         return false
     end
 
+    pcall(function()
+        local cameraPosition = camera.CFrame.Position
+        camera.CFrame = CFrame.lookAt(cameraPosition, root.Position, camera.CFrame.UpVector)
+    end)
+    task.wait(0.04)
     local point, onScreen = camera:WorldToScreenPoint(root.Position)
     if not onScreen or isScreenPointOverToolkit(point.X, point.Y) then
         return false
@@ -2790,59 +3138,69 @@ local function collectLootObject(object, root, prompt, clickDetector)
         return false
     end
 
+    local attempted = false
     if prompt and prompt.Parent and prompt.Enabled then
         if type(fireproximityprompt) == "function" then
             local ok = pcall(fireproximityprompt, prompt)
-            if ok then
+            attempted = attempted or ok
+            task.wait(0.08)
+            if not object.Parent or isPlayerInventoryObject(object) then
                 return true
             end
         end
-        local oldDuration = prompt.HoldDuration
-        local began = pcall(function()
-            prompt:InputHoldBegin()
-        end)
-        if not began then
-            return false
+
+        if prompt.Parent and prompt.Enabled then
+            local began = pcall(function()
+                prompt:InputHoldBegin()
+            end)
+            if began then
+                attempted = true
+                local holdDuration = 0
+                pcall(function()
+                    holdDuration = prompt.HoldDuration
+                end)
+                task.wait(math.max(0.05, math.min(holdDuration, 5.0)))
+                local ended = pcall(function()
+                    prompt:InputHoldEnd()
+                end)
+                attempted = attempted or ended
+                task.wait(0.08)
+                if not object.Parent or isPlayerInventoryObject(object) then
+                    return true
+                end
+            end
         end
-        task.wait(math.max(0.05, math.min(oldDuration, 1.0)))
-        local ended = pcall(function()
-            prompt:InputHoldEnd()
-        end)
-        return ended
     end
 
     if clickDetector and clickDetector.Parent and type(fireclickdetector) == "function" then
         local ok = pcall(fireclickdetector, clickDetector)
-        if ok then
+        attempted = attempted or ok
+        task.wait(0.08)
+        if not object.Parent or isPlayerInventoryObject(object) then
             return true
         end
     end
 
-    return clickWorldObject(root)
+    local clicked = clickWorldObject(root)
+    return attempted or clicked
 end
 
 local function runAutoLoot()
+    local waitingAtBusForManualUnload = false
+
     while state.running do
         local ok, err = pcall(function()
             if not state.autoLoot then
                 lootStatus = "Off"
                 lootCurrentTarget = "--"
-                lootMovementToken = lootMovementToken + 1
-                if activeAutomationHumanoid then
-                    pcall(function()
-                        activeAutomationHumanoid:Move(Vector3.zero, false)
-                    end)
-                    activeAutomationHumanoid = nil
-                end
+                waitingAtBusForManualUnload = false
                 task.wait(0.25)
                 return
             end
 
-            if state.killAura and combatTargetActive then
-                lootMovementToken = lootMovementToken + 1
-                activeAutomationHumanoid = nil
+            if (state.killAura and combatTargetActive) or ((state.gunAimAssist or state.gunAutoShoot) and gunTargetActive) then
                 lootStatus = "Paused for combat"
-                lootCurrentTarget = currentAuraTargetName
+                lootCurrentTarget = state.killAura and currentAuraTargetName or gunTargetName
                 task.wait(0.2)
                 return
             end
@@ -2850,7 +3208,6 @@ local function runAutoLoot()
             local character = LocalPlayer.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = character and character:FindFirstChild("HumanoidRootPart")
-
             if not humanoid or humanoid.Health <= 0 or not root then
                 lootStatus = "Waiting for respawn"
                 task.wait(0.3)
@@ -2858,9 +3215,22 @@ local function runAutoLoot()
             end
 
             local inventoryCount = getInventoryItemCount()
+            if waitingAtBusForManualUnload and not state.autoReturnBus then
+                waitingAtBusForManualUnload = false
+            end
+            if waitingAtBusForManualUnload and state.autoReturnBus then
+                if inventoryCount >= state.lootReturnThreshold then
+                    lootStatus = "At bus - unload inventory manually"
+                    lootCurrentTarget = "Bus"
+                    task.wait(1)
+                    return
+                end
+                waitingAtBusForManualUnload = false
+                lootCollectedSinceReturn = 0
+            end
+
             local shouldReturn = state.autoReturnBus and inventoryCount >= state.lootReturnThreshold
             local target, targetRoot, distance, prompt, clickDetector, lootCoolingDown
-
             if not shouldReturn then
                 target, targetRoot, distance, prompt, clickDetector, lootCoolingDown = findNearestLoot(root.Position, state.lootRange)
             end
@@ -2868,40 +3238,78 @@ local function runAutoLoot()
             if target and targetRoot then
                 lootCurrentTarget = target.Name
                 local pickupRange = getLootPickupRange(prompt, clickDetector)
+
                 if distance > pickupRange then
-                    lootStatus = string.format("Approaching %s (%.0f studs)", target.Name, distance)
-                    lootMovementToken = lootMovementToken + 1
-                    local token = lootMovementToken
-                    local moved = moveAutomationTo(humanoid, root, targetRoot.Position, token, false, pickupRange)
-                    if not moved and target.Parent and not (state.killAura and combatTargetActive) then
-                        lootLastAttempt[target] = os.clock()
-                        lootStatus = "Path blocked: " .. target.Name
+                    lootStatus = "Teleporting to " .. target.Name
+                    local teleported = teleportNearLoot(root, targetRoot, pickupRange)
+                    if teleported then
+                        lootTeleports = lootTeleports + 1
+                        task.wait(0.08)
+                        distance = (targetRoot.Position - root.Position).Magnitude
+                    else
+                        local failures = (lootFailedAttempts[target] or 0) + 1
+                        lootFailedAttempts[target] = failures
+                        lootLastAttempt[target] = os.clock() + 8
+                        if failures >= 2 then
+                            lootCandidates[target] = nil
+                        end
+                        lootStatus = "Teleport rejected; skipping " .. target.Name
+                        task.wait(0.25)
+                        return
                     end
-                else
-                    lootStatus = "Picking up " .. target.Name
+                end
+
+                if target.Parent and distance <= pickupRange + 0.75 then
                     if not prompt and (not clickDetector or type(fireclickdetector) ~= "function") then
                         aimLootCamera(targetRoot)
+                        task.wait(0.05)
                     end
+
                     lootAttempts = lootAttempts + 1
                     local beforeCount = getInventoryItemCount()
                     local interacted = collectLootObject(target, targetRoot, prompt, clickDetector)
-                    lootLastAttempt[target] = interacted and os.clock() or (os.clock() - 1.0)
-                    task.wait(0.35)
+                    task.wait(0.4)
+
                     local afterCount = getInventoryItemCount()
                     local movedToInventory = isPlayerInventoryObject(target)
-                    if not target.Parent or movedToInventory or afterCount > beforeCount then
+                    local collected = not target.Parent or movedToInventory or afterCount > beforeCount
+                    if collected then
                         lootCollected = lootCollected + 1
                         lootCollectedSinceReturn = lootCollectedSinceReturn + 1
+                        lootFailedAttempts[target] = nil
+                        lootLastAttempt[target] = os.clock() + 2
+                        if not target:IsDescendantOf(Workspace) then
+                            lootCandidates[target] = nil
+                            lootInteractionCache[target] = nil
+                        end
                         lootStatus = "Collected " .. target.Name
-                    elseif not interacted then
-                        lootStatus = "No pickup input: " .. target.Name
                     else
-                        lootStatus = "Pickup not confirmed: " .. target.Name
+                        local failures = (lootFailedAttempts[target] or 0) + 1
+                        lootFailedAttempts[target] = failures
+                        lootLastAttempt[target] = os.clock() + (failures >= 2 and 15 or 3)
+                        if failures >= 2 then
+                            lootCandidates[target] = nil
+                            lootStatus = "Pickup failed twice; skipped " .. target.Name
+                        elseif not interacted then
+                            lootStatus = "No pickup input; retrying " .. target.Name
+                        else
+                            lootStatus = "Pickup unconfirmed; retrying " .. target.Name
+                        end
                     end
+                else
+                    local failures = (lootFailedAttempts[target] or 0) + 1
+                    lootFailedAttempts[target] = failures
+                    lootLastAttempt[target] = os.clock() + 8
+                    if failures >= 2 then
+                        lootCandidates[target] = nil
+                    end
+                    lootStatus = "Outside pickup range after teleport"
                 end
-            elseif lootCoolingDown then
-                lootStatus = "Waiting to retry pickup"
+
+            elseif lootCoolingDown and lootCollectedSinceReturn <= 0 and not shouldReturn then
+                lootStatus = "Waiting for pickup retry"
                 task.wait(0.2)
+
             elseif state.autoReturnBus and (shouldReturn or lootCollectedSinceReturn > 0) then
                 local bus, busRoot, seat = findNearestBus(root.Position)
                 local destination = bus and getBusReturnPosition(bus, busRoot, seat) or nil
@@ -2909,29 +3317,21 @@ local function runAutoLoot()
                     lootCurrentTarget = bus.Name
                     local busDistance = (destination - root.Position).Magnitude
                     if busDistance > 8 then
-                        lootStatus = string.format("Returning to bus (%.0f studs)", busDistance)
-                        lootMovementToken = lootMovementToken + 1
-                        local token = lootMovementToken
-                        local moved = moveAutomationTo(humanoid, root, destination, token, true)
-                        if not moved and not (state.killAura and combatTargetActive) then
-                            if not state.autoReturnBus then
-                                pcall(function() humanoid:MoveTo(root.Position) end)
-                                activeAutomationHumanoid = nil
-                                lootStatus = "Return cancelled"
-                            else
-                                lootStatus = "Could not reach bus"
-                            end
+                        lootStatus = string.format("Teleporting to bus (%.0f studs)", busDistance)
+                        local teleported = teleportRootTo(root, destination, busRoot.Position)
+                        if teleported then
+                            lootTeleports = lootTeleports + 1
+                            lootCollectedSinceReturn = 0
+                            waitingAtBusForManualUnload = shouldReturn
+                            lootStatus = shouldReturn and "At bus - unload inventory manually" or "Returned to bus"
+                        else
+                            lootStatus = "Bus teleport rejected by server"
                         end
+                        task.wait(0.5)
                     else
                         lootCollectedSinceReturn = 0
-                        if shouldReturn then
-                            lootStatus = "At bus - unload inventory manually"
-                        else
-                            lootStatus = "At bus - sweep complete"
-                        end
-                        pcall(function()
-                            humanoid:MoveTo(root.Position)
-                        end)
+                        waitingAtBusForManualUnload = shouldReturn
+                        lootStatus = shouldReturn and "At bus - unload inventory manually" or "At bus - sweep complete"
                         task.wait(0.8)
                     end
                 else
@@ -2947,27 +3347,10 @@ local function runAutoLoot()
         end)
 
         if not ok then
-            lootMovementToken = lootMovementToken + 1
-            if not (state.killAura and combatTargetActive) then
-                local character = LocalPlayer.Character
-                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-                local root = character and character:FindFirstChild("HumanoidRootPart")
-                if humanoid and root then
-                    pcall(function() humanoid:MoveTo(root.Position) end)
-                end
-                activeAutomationHumanoid = nil
-            end
             lootStatus = "Loot error: " .. tostring(err):sub(1, 48)
             task.wait(0.3)
         end
         task.wait(0.08)
-    end
-
-    if activeAutomationHumanoid then
-        pcall(function()
-            activeAutomationHumanoid:Move(Vector3.zero, false)
-        end)
-        activeAutomationHumanoid = nil
     end
 end
 
@@ -3091,9 +3474,8 @@ track(RunService.Stepped:Connect(function()
 end))
 
 track(LocalPlayer.CharacterAdded:Connect(function(character)
-    lootMovementToken = lootMovementToken + 1
-    activeAutomationHumanoid = nil
     combatTargetActive = false
+    gunTargetActive = false
     releaseAuraInput()
     restoreWalkSpeed()
     bindCharacterNoClip(character)
@@ -3215,7 +3597,7 @@ local function updateHud()
     end
 
     hudLabel.Text = string.format(
-        "%s  |  Players %d\nESP: %d  |  NPCs: %d  |  Aura: %s\nWeapon: %s  |  Target: %s\nHP drops: %d  |  Input sessions: %d  |  %s\nLoot: %s\nLooted: %d  |  Attempts: %d  |  Target: %s  |  Candidates: %d",
+        "%s  |  Players %d\nESP: %d  |  NPCs: %d\nMelee: %s  |  Hits: %d  |  Clicks: %d\nGun: %s  |  Target: %s\nGun inputs: %d  |  Hits: %d  |  Blocked: %d\nLoot: %s  |  Looted: %d  |  TPs: %d\nAttempts: %d  |  Target: %s  |  Candidates: %d",
         healthText,
         #Players:GetPlayers(),
         lastScanCount,
@@ -3227,13 +3609,16 @@ local function updateHud()
             return count
         end)(),
         currentAuraStatus,
-        currentAuraWeapon,
-        currentAuraTargetName,
         auraConfirmedHits,
         auraAttackAttempts,
-        currentAuraInput,
+        gunStatus,
+        gunTargetName,
+        gunShots,
+        gunConfirmedHits,
+        gunBlockedShots,
         lootStatus,
         lootCollected,
+        lootTeleports,
         lootAttempts,
         lootCurrentTarget,
         lootCandidateCount
