@@ -1,5 +1,5 @@
 --[[
-    LAST STOP [BETA] - ROADSIDE TOOLKIT v9
+    LAST STOP [BETA] - ROADSIDE TOOLKIT v10.2
     Client-side survival toolkit.
 
     Included:
@@ -54,14 +54,20 @@ env.__LASTSTOP_TOOLKIT_CLEANUP = nil
 
 local state = {
     replicatedStorage = game:GetService("ReplicatedStorage"),
-    currentAuraApi = "Not detected",
-    currentGunApi = "Not detected",
-    currentLootApi = "Visible input",
+    currentAuraApi = "Not scanned",
+    currentGunApi = "Not scanned",
+    currentLootApi = "Not scanned",
     cachedGlobalSwingRemote = nil,
     lastGlobalSwingRemoteScan = -math.huge,
     cachedGlobalSwingPath = nil,
     cachedDeadRailsShootRemote = nil,
     cachedDeadRailsLootRemotes = {},
+    deadRailsRemoteScanAt = {},
+    deadRailsToolRemoteScanAt = {},
+    cachedObjectModelsFolder = nil,
+    cachedRuntimeItemsFolder = nil,
+    objectModelsScanAt = 0,
+    runtimeItemsScanAt = 0,
     running = true,
     loot = true,
     zombies = true,
@@ -77,16 +83,30 @@ local state = {
     auraFace = false,
     auraAimCamera = false,
     auraHitRange = 6.5, -- input fallback only; native remotes use acquisition range
-    auraRange = 120,
+    auraRange = 250,
     auraInterval = 0.01,
     gunAimAssist = false,
     gunAutoShoot = false,
+    gunAutoReload = false,
+    lastGunReloadAt = 0,
     gunWallCheck = true,
+    rapidToolResetMelee = false,
+    rapidMeleeBusy = false,
+    lastRapidMeleeAt = 0,
     gunRange = 180,
     gunFireInterval = 0.22,
     autoLoot = false,
     autoReturnBus = true,
+    autoStoreAtBus = false,
+    autoEmergencyReturn = false,
+    autoCollectMoney = true,
+    autoCollectBonds = true,
+    autoCollectAmmo = true,
+    autoCollectGuns = true,
+    autoCollectMeds = true,
     manualReturnRequested = false,
+    manualStoreRequested = false,
+    manualDiagnosticsRequested = false,
     currentAuraTargetInstance = nil,
     auraUnverifiedCount = 0,
     deadAuraBlacklist = setmetatable({}, {__mode = "k"}),
@@ -425,7 +445,7 @@ make("TextLabel", {
     Position = UDim2.new(0, 14, 0, 27),
     Size = UDim2.new(1, -105, 0, 13),
     BackgroundTransparency = 1,
-    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V8",
+    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V10.2",
     TextColor3 = palette.muted,
     Font = Enum.Font.Gotham,
     TextSize = 9,
@@ -503,6 +523,7 @@ statusLabel = make("TextLabel", {
 }, footer)
 
 local layoutOrder = 0
+local toggleRefreshers = {}
 
 local function addSection(text)
     layoutOrder = layoutOrder + 1
@@ -576,6 +597,7 @@ local function addToggle(labelText, key, description)
     end
 
     refresh()
+    toggleRefreshers[key] = refresh
 
     track(row.MouseButton1Click:Connect(function()
         if key == "performance" then
@@ -598,6 +620,33 @@ local function addToggle(labelText, key, description)
     end))
 end
 
+local function setFeatureToggle(key, value)
+    state[key] = value
+    local refresh = toggleRefreshers[key]
+    if refresh then
+        refresh()
+    end
+end
+
+local function addActionButton(labelText, callback, backgroundColor)
+    layoutOrder = layoutOrder + 1
+    local button = make("TextButton", {
+        Name = "Action_" .. string.gsub(labelText, "%W+", ""),
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = backgroundColor or palette.panel,
+        BorderSizePixel = 0,
+        Text = labelText,
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        AutoButtonColor = false,
+        LayoutOrder = layoutOrder,
+    }, content)
+    make("UICorner", {CornerRadius = UDim.new(0, 7)}, button)
+    track(button.MouseButton1Click:Connect(callback))
+    return button
+end
+
 local function addAuraRangeControl()
     layoutOrder = layoutOrder + 1
     local row = make("Frame", {
@@ -613,7 +662,7 @@ local function addAuraRangeControl()
         Position = UDim2.new(0, 11, 0, 0),
         Size = UDim2.new(1, -145, 1, 0),
         BackgroundTransparency = 1,
-        Text = "Aura target acquisition radius",
+        Text = "Aura scan radius (not melee hitbox)",
         TextColor3 = palette.text,
         Font = Enum.Font.GothamSemibold,
         TextSize = 11,
@@ -1118,7 +1167,7 @@ addToggle("Distance labels", "distance")
 addDistanceControl()
 
 addSection("Combat")
-addToggle("Zombie / enemy kill aura", "killAura", "Uses detected SwingMelee / SwingEvent API when available; never chases")
+addToggle("Zombie / enemy kill aura", "killAura", "Continuous native swing at 0.01s when supported; never chases")
 addToggle("Include bosses", "auraBosses", "Includes Fred, Anubis, Dracula, Crystalus and Juggernaut")
 addToggle("Target unknown NPCs", "auraAllNPCs", "Fallback detection; known friendly NPCs are excluded")
 addToggle("Auto-equip melee", "autoEquipMelee", "Equips an available melee tool when none is equipped")
@@ -1126,13 +1175,23 @@ addToggle("Auto-face target", "auraFace", "Optional facing; native melee request
 addToggle("Aim camera at target", "auraAimCamera", "Optional camera movement; not required by native melee requests")
 addToggle("Gun auto-aim", "gunAimAssist", "Aims at the nearest visible hostile while a firearm is equipped")
 addToggle("Gun auto-shoot", "gunAutoShoot", "Fires only when a raycast confirms a clear line to the target")
+addToggle("Gun auto-reload", "gunAutoReload", "Uses the Dead Rails Reload remote only when an ammo counter reads zero")
+addToggle("Experimental weapon-reset melee", "rapidToolResetMelee", "Dead Rails DropTool -> PickUpTool -> SwingEvent adapter; may temporarily drop your weapon")
 addGunRangeControl()
 addAuraRangeControl()
 addAttackDelayControl()
 
 addSection("Automation")
 addToggle("Auto loot nearby items", "autoLoot", "Safe-side teleports to valid pickups; ignores wheels, vehicles and buildings")
-addToggle("Return to bus when done", "autoReturnBus", "Teleports back after a loot sweep or inventory threshold; storage may need manual unload")
+addToggle("Return to bus when done", "autoReturnBus", "Teleports back after a loot sweep or inventory threshold")
+addToggle("Auto-store at bus", "autoStoreAtBus", "Uses RuntimeItems + Store only when that exact API is detected")
+addToggle("Emergency return below 35% HP", "autoEmergencyReturn", "Requests a bus return when health falls below 35 percent")
+addSection("Loot priorities")
+addToggle("Money bags / cash", "autoCollectMoney")
+addToggle("Bonds", "autoCollectBonds")
+addToggle("Ammo", "autoCollectAmmo")
+addToggle("Weapons", "autoCollectGuns")
+addToggle("Medical supplies", "autoCollectMeds")
 addLootRangeControl()
 addLootReturnThresholdControl()
 
@@ -1156,6 +1215,30 @@ track(emergencyReturnButton.MouseButton1Click:Connect(function()
     lootStatus = "Emergency return requested"
 end))
 end
+
+addActionButton("STORE INVENTORY AT BUS (IF SUPPORTED)", function()
+    state.manualStoreRequested = true
+    lootStatus = "Store request queued"
+end, Color3.fromRGB(37, 67, 78))
+
+addActionButton("COPY GAME API DIAGNOSTICS", function()
+    state.manualDiagnosticsRequested = true
+    lootStatus = "Diagnostics queued"
+end, Color3.fromRGB(37, 67, 78))
+
+addActionButton("START MELEE + AUTO LOOT", function()
+    setFeatureToggle("killAura", true)
+    setFeatureToggle("autoLoot", true)
+    if statusLabel then statusLabel.Text = "Melee + auto loot enabled" end
+end, Color3.fromRGB(42, 76, 62))
+
+addActionButton("STOP ALL AUTOMATION", function()
+    setFeatureToggle("killAura", false)
+    setFeatureToggle("autoLoot", false)
+    setFeatureToggle("gunAimAssist", false)
+    setFeatureToggle("gunAutoShoot", false)
+    if statusLabel then statusLabel.Text = "Combat and loot automation stopped" end
+end, Color3.fromRGB(76, 42, 48))
 
 addSection("Movement")
 addToggle("No clip", "noClip", "Disables character part collisions locally; restores them when off")
@@ -1534,6 +1617,9 @@ local function isMeleeTool(tool)
     if ok and isMelee == true then
         return true
     end
+    if tool:FindFirstChild("MeleeWeaponConfiguration", true) then
+        return true
+    end
 
     return hasAny(toolName, meleeWords)
 end
@@ -1859,8 +1945,8 @@ state.resolveMeleeRemote = function(tool)
 end
 
 state.sendNativeMelee = function(tool, targetRoot, characterRoot)
-    if not tool or not targetRoot or not targetRoot.Parent or not characterRoot then
-        return false, "Missing equipped tool / target"
+    if not tool or not characterRoot then
+        return false, "Missing equipped melee Tool / character root"
     end
 
     local remote, apiName, apiKind = state.resolveMeleeRemote(tool)
@@ -1869,12 +1955,20 @@ state.sendNativeMelee = function(tool, targetRoot, characterRoot)
         return false, apiName
     end
 
-    local offset = targetRoot.Position - characterRoot.Position
-    if offset.Magnitude < 0.001 then
-        local camera = Workspace.CurrentCamera
-        offset = camera and camera.CFrame.LookVector or Vector3.new(0, 0, -1)
+    -- Dead Rails' public Auto Swing loop sends a native swing every 0.01s
+    -- using the camera direction, even when it has no local target candidate.
+    -- When a target is known, prefer its direction; otherwise use camera-forward.
+    local direction
+    if targetRoot and targetRoot.Parent then
+        local offset = targetRoot.Position - characterRoot.Position
+        if offset.Magnitude > 0.001 then
+            direction = offset.Unit
+        end
     end
-    local direction = offset.Unit
+    if not direction then
+        local camera = Workspace.CurrentCamera
+        direction = camera and camera.CFrame.LookVector or characterRoot.CFrame.LookVector
+    end
 
     local ok, err = pcall(function()
         if apiKind == "tool" then
@@ -2586,6 +2680,168 @@ track(Workspace.DescendantRemoving:Connect(function(instance)
     end
 end))
 
+state.deadRailsToolRemoteCache = state.deadRailsToolRemoteCache or {}
+state.getDeadRailsToolRemote = function(remoteName)
+    local cached = state.deadRailsToolRemoteCache[remoteName]
+    if cached and cached.Parent then return cached end
+
+    local remotes = state.replicatedStorage:FindFirstChild("Remotes")
+    local toolFolder = remotes and remotes:FindFirstChild("Tool")
+    local candidate = toolFolder and toolFolder:FindFirstChild(remoteName)
+    if candidate and candidate:IsA("RemoteEvent") then
+        state.deadRailsToolRemoteCache[remoteName] = candidate
+        return candidate
+    end
+
+    -- Fallback only to a unique exact-name match, never a partial remote name.
+    -- Throttle negative scans because Kill Aura can ask for this adapter every tick.
+    local lastScan = state.deadRailsToolRemoteScanAt[remoteName] or -math.huge
+    if lastScan > 0 and os.clock() - lastScan < 3 then
+        return nil
+    end
+    state.deadRailsToolRemoteScanAt[remoteName] = os.clock()
+    local matches = {}
+    for _, object in ipairs(state.replicatedStorage:GetDescendants()) do
+        if object:IsA("RemoteEvent") and object.Name == remoteName then
+            table.insert(matches, object)
+            if #matches > 1 then break end
+        end
+    end
+    if #matches == 1 then
+        state.deadRailsToolRemoteCache[remoteName] = matches[1]
+        return matches[1]
+    end
+    return nil
+end
+
+state.getDirectRuntimeItemsFolder = function()
+    local direct = Workspace:FindFirstChild("RuntimeItems")
+    if direct and (direct:IsA("Folder") or direct:IsA("Model")) then
+        return direct
+    end
+    local cached = state.cachedRuntimeItemsFolder
+    if cached and cached.Parent then return cached end
+    return nil
+end
+
+state.rapidToolResetAvailable = function(tool)
+    if not state.rapidToolResetMelee or not tool or not tool.Parent
+        or not tool:FindFirstChild("MeleeWeaponConfiguration", true) then
+        return false
+    end
+    return state.getDeadRailsToolRemote("DropTool") ~= nil
+        and state.getDeadRailsToolRemote("PickUpTool") ~= nil
+        and state.getDirectRuntimeItemsFolder() ~= nil
+end
+
+state.startRapidToolResetSwing = function(tool, targetRoot, characterRoot)
+    if state.rapidMeleeBusy then return false, "Weapon reset busy" end
+    if not state.rapidToolResetAvailable(tool) then return false, "DropTool/PickUpTool API unavailable" end
+    if not targetRoot or not targetRoot.Parent or not characterRoot then return false, "Target unavailable" end
+    local distance = (targetRoot.Position - characterRoot.Position).Magnitude
+    if distance > 10 then return false, "Tool-reset reference only targets within about 10 studs" end
+
+    local dropRemote = state.getDeadRailsToolRemote("DropTool")
+    local pickupRemote = state.getDeadRailsToolRemote("PickUpTool")
+    local runtimeItems = state.getDirectRuntimeItemsFolder()
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if not dropRemote or not pickupRemote or not runtimeItems or not humanoid or not backpack then
+        return false, "Tool-reset prerequisites missing"
+    end
+
+    state.rapidMeleeBusy = true
+    task.spawn(function()
+        local success, err = pcall(function()
+            local weaponName = tool.Name
+            if tool.Parent ~= character then
+                local inBackpack = backpack:FindFirstChild(weaponName)
+                if inBackpack and inBackpack:IsA("Tool") then
+                    humanoid:EquipTool(inBackpack)
+                    task.wait(0.05)
+                    tool = character:FindFirstChild(weaponName) or inBackpack
+                else
+                    error("Melee tool is not equipped")
+                end
+            end
+
+            dropRemote:FireServer(tool)
+            local runtimeItem = nil
+            local deadline = os.clock() + 0.65
+            repeat
+                runtimeItem = runtimeItems:FindFirstChild(weaponName)
+                if runtimeItem then break end
+                task.wait(0.025)
+            until os.clock() >= deadline
+
+            if not runtimeItem then
+                local recovered = backpack:FindFirstChild(weaponName) or character:FindFirstChild(weaponName)
+                if recovered and recovered.Parent == backpack then
+                    humanoid:EquipTool(recovered)
+                end
+                error("Dropped tool did not appear in RuntimeItems")
+            end
+
+            local recoveredTool = nil
+            for attempt = 1, 5 do
+                if not runtimeItem.Parent then break end
+                pickupRemote:FireServer(runtimeItem)
+                task.wait(0.05)
+                recoveredTool = backpack:FindFirstChild(weaponName)
+                if recoveredTool then break end
+            end
+
+            deadline = os.clock() + 0.55
+            while not recoveredTool and os.clock() < deadline do
+                recoveredTool = backpack:FindFirstChild(weaponName)
+                task.wait(0.025)
+            end
+            if not recoveredTool then
+                -- One final bounded pickup attempt; never loop indefinitely.
+                runtimeItem = runtimeItems:FindFirstChild(weaponName)
+                if runtimeItem then
+                    for _ = 1, 3 do
+                        pickupRemote:FireServer(runtimeItem)
+                        task.wait(0.06)
+                        recoveredTool = backpack:FindFirstChild(weaponName)
+                        if recoveredTool then break end
+                    end
+                end
+            end
+            if not recoveredTool then
+                error("Weapon pickup was not confirmed; check RuntimeItems")
+            end
+
+            humanoid:EquipTool(recoveredTool)
+            task.wait(0.04)
+            local equipped = character:FindFirstChild(weaponName) or recoveredTool
+            local swingEvent = equipped:FindFirstChild("SwingEvent", true)
+            if not swingEvent or not swingEvent:IsA("RemoteEvent") then
+                error("SwingEvent missing after tool pickup")
+            end
+
+            local direction = (targetRoot.Position - characterRoot.Position)
+            if direction.Magnitude < 0.001 then
+                direction = Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.LookVector or characterRoot.CFrame.LookVector
+            else
+                direction = direction.Unit
+            end
+            swingEvent:FireServer(direction)
+            auraAttackAttempts = auraAttackAttempts + 1
+            state.currentAuraApi = "DropTool/PickUpTool -> SwingEvent"
+            currentAuraInput = "tool-reset swing"
+            currentAuraStatus = "Rapid tool-reset swing -> " .. targetRoot.Parent.Name
+        end)
+        if not success then
+            state.currentAuraApi = "Tool-reset failed"
+            currentAuraStatus = "Tool-reset: " .. tostring(err):sub(1, 48)
+        end
+        state.rapidMeleeBusy = false
+    end)
+    return true, "Tool-reset swing queued"
+end
+
 local function runKillAura()
     local trackedTarget = nil
     local trackedHealth = nil
@@ -2600,6 +2856,7 @@ local function runKillAura()
                 combatTargetActive = false
                 releaseAuraInput()
                 currentAuraStatus = "Off"
+                state.currentAuraApi = "Idle (toggle off)"
                 currentAuraTargetName = "--"
                 state.currentAuraTargetInstance = nil
                 currentAuraWeapon = "--"
@@ -2669,7 +2926,10 @@ local function runKillAura()
             end
             local meleeRemote, meleeApiName, meleeApiKind = state.resolveMeleeRemote(meleeTool)
             local nativeMeleeAvailable = meleeRemote ~= nil and meleeTool ~= nil
-            state.currentAuraApi = nativeMeleeAvailable and meleeApiName or "Input fallback"
+            local rapidAdapterAvailable = state.rapidToolResetAvailable(meleeTool)
+            state.currentAuraApi = nativeMeleeAvailable and meleeApiName
+                or (rapidAdapterAvailable and "DropTool/PickUpTool + SwingEvent available")
+                or (meleeTool and "No compatible native remote; input fallback" or "No Tool object; input fallback")
             if not target or not targetRoot then
                 combatTargetActive = false
                 releaseAuraInput()
@@ -2679,7 +2939,21 @@ local function runKillAura()
                 trackedHealth = nil
                 cachedAuraTarget = nil
                 cachedAuraKind = nil
-                if state.auraUnverifiedCount > 0 then
+
+                -- Native auto-swing does not need a locally selected NPC. The
+                -- server performs its own melee hitbox check, as in the public
+                -- Dead Rails reference. This is not a promise of extra hit range.
+                if nativeMeleeAvailable and meleeReady and meleeTool
+                    and os.clock() - lastAuraAttack >= state.auraInterval then
+                    local sent, mode = state.sendNativeMelee(meleeTool, nil, characterRoot)
+                    if sent then
+                        lastAuraAttack = os.clock()
+                        currentAuraStatus = "Native auto-swing (camera direction)"
+                        state.currentAuraApi = mode or meleeApiName
+                    else
+                        currentAuraStatus = tostring(mode or "Native swing failed")
+                    end
+                elseif state.auraUnverifiedCount > 0 then
                     currentAuraStatus = string.format("Skipped %d NPCs without a live-health signal", state.auraUnverifiedCount)
                 else
                     currentAuraStatus = state.auraAllNPCs and "No NPC in range" or "No recognized hostile in range"
@@ -2722,7 +2996,7 @@ local function runKillAura()
                 return
             end
 
-            if not nativeMeleeAvailable and distance > state.auraHitRange then
+            if not nativeMeleeAvailable and not rapidAdapterAvailable and distance > state.auraHitRange then
                 combatTargetActive = false
                 releaseAuraInput()
                 state.currentAuraApi = "Input fallback only"
@@ -2733,6 +3007,25 @@ local function runKillAura()
             end
 
             combatTargetActive = true
+
+            if rapidAdapterAvailable and not nativeMeleeAvailable then
+                if distance > 10 then
+                    currentAuraStatus = "Tool-reset adapter range: about 10 studs"
+                    return
+                end
+                if not state.rapidMeleeBusy and os.clock() - lastAuraAttack >= math.max(state.auraInterval, 0.12) then
+                    local started, message = state.startRapidToolResetSwing(meleeTool, targetRoot, characterRoot)
+                    if started then
+                        lastAuraAttack = os.clock()
+                        currentAuraStatus = "Rapid tool-reset swing -> " .. targetKind
+                    else
+                        currentAuraStatus = tostring(message or "Tool-reset swing unavailable")
+                    end
+                elseif state.rapidMeleeBusy then
+                    currentAuraStatus = "Rapid tool-reset swing in progress"
+                end
+                return
+            end
 
             -- Native requests carry a target direction, so no camera or character
             -- movement is required. Facing/camera options remain optional for fallback.
@@ -3044,6 +3337,59 @@ local function fireGunClick(targetPart, targetModel, gun, character)
     return true
 end
 
+local function getGunAmmoCount(gun)
+    if not gun then return nil end
+    local names = {"Ammo", "CurrentAmmo", "AmmoCount", "LoadedAmmo", "Clip", "Magazine", "Bullets"}
+    for _, name in ipairs(names) do
+        local ok, value = pcall(function() return gun:GetAttribute(name) end)
+        if ok and type(value) == "number" then return value end
+    end
+    for _, object in ipairs(gun:GetDescendants()) do
+        if object:IsA("IntValue") or object:IsA("NumberValue") then
+            local lower = string.lower(object.Name)
+            if hasAny(lower, {"ammo", "clip", "magazine", "bullet"}) then
+                return tonumber(object.Value)
+            end
+        end
+    end
+    return nil
+end
+
+local function tryDeadRailsAutoReload(gun)
+    if not state.gunAutoReload or not gun then return false end
+    local ammo = getGunAmmoCount(gun)
+    if ammo == nil or ammo > 0 or os.clock() - state.lastGunReloadAt < 1.5 then
+        return false
+    end
+
+    local cached = state.cachedDeadRailsReloadRemote
+    if not (cached and cached.Parent) then
+        local remotes = state.replicatedStorage:FindFirstChild("Remotes")
+        local weapon = remotes and remotes:FindFirstChild("Weapon")
+        local candidate = weapon and weapon:FindFirstChild("Reload")
+        if candidate and candidate:IsA("RemoteEvent") then
+            state.cachedDeadRailsReloadRemote = candidate
+            cached = candidate
+        end
+    end
+    if not cached then
+        state.currentGunApi = "Reload remote not found"
+        return false
+    end
+
+    local ok = pcall(function()
+        cached:FireServer(Workspace:GetServerTimeNow(), gun)
+    end)
+    if ok then
+        state.lastGunReloadAt = os.clock()
+        state.currentGunApi = "Remotes.Weapon.Reload"
+        gunStatus = "Reload request sent"
+        return true
+    end
+    state.currentGunApi = "Reload request failed"
+    return false
+end
+
 local function runGunAssist()
     local trackedGunTarget = nil
     local trackedGunHealth = nil
@@ -3053,6 +3399,7 @@ local function runGunAssist()
             gunTargetActive = false
             if not state.gunAimAssist and not state.gunAutoShoot then
                 gunStatus = "Off"
+                state.currentGunApi = "Idle (toggle off)"
                 gunTargetName = "--"
                 trackedGunTarget = nil
                 trackedGunHealth = nil
@@ -3073,6 +3420,10 @@ local function runGunAssist()
                 gunStatus = "Equip a firearm"
                 gunTargetName = "--"
                 state.currentGunApi = "No firearm"
+                return
+            end
+
+            if state.gunAutoReload and tryDeadRailsAutoReload(gun) then
                 return
             end
 
@@ -3159,7 +3510,10 @@ local lootNameWords = {
     "engine part", "fuse", "canister", "crate", "box", "supply", "lootbox",
     "globe", "artifact", "antique", "cash", "ticket", "coin", "gold", "silver",
     "jewelry", "watch", "medallion", "quest item", "medical", "meds",
-    "tutoitem", "tuto item", "lootitem", "loot item", "worlditem", "world item"
+    "bond", "money bag", "money_bag", "snake oil", "snake_oil", "ammo_",
+    "mauser", "crossbow", "elephant rifle", "bolt action rifle", "blunderbuss",
+    "firework gun", "flintlock", "springfield", "sawed off shotgun", "revolver rifle",
+    "navy revolver", "tutoitem", "tuto item", "lootitem", "loot item", "worlditem", "world item"
 }
 local pickupActionWords = {"grab", "pick up", "pickup", "collect", "take"}
 state.lootNeverWords = {
@@ -3187,8 +3541,10 @@ state.isExcludedLootCandidate = function(candidate, promptObjectText)
 
     local candidateName = string.lower(candidate.Name)
     local promptName = string.lower(promptObjectText or "")
-    if hasAny(candidateName, {"wheel", "tire", "tyre", "rim", "hubcap", "bus", "vehicle", "truck", "garage", "chassis", "building"})
-        or hasAny(promptName, {"wheel", "tire", "tyre", "rim", "hubcap", "bus", "vehicle", "truck", "garage", "chassis"})
+    local contextName = getContextName(candidate)
+    if hasAny(contextName, {"wheel", "tire", "tyre", "rim", "hubcap"})
+        or hasAny(candidateName, {"wheel", "tire", "tyre", "rim", "hubcap", "bus", "vehicle", "truck", "garage", "chassis", "building"})
+        or hasAny(promptName, {"wheel", "tire", "tyre", "rim", "hubcap", "bus", "vehicle", "truck", "garage", "chassis", "building", "house", "terminal"})
         or state.hasLootWord(candidateName, state.lootNeverWords)
         or state.hasLootWord(promptName, {"wheel", "tire", "tyre", "rim", "hubcap", "bus", "vehicle", "truck", "car", "van"}) then
         return true
@@ -3216,7 +3572,8 @@ local function isInsideLootFolder(instance)
         end
         local name = string.lower(parent.Name)
         if name == "loot" or name == "items" or name == "drops"
-            or name == "pickups" or name == "worlditems" or name == "looseitems" then
+            or name == "pickups" or name == "worlditems" or name == "looseitems"
+            or name == "runtimeitems" then
             return true
         end
         parent = parent.Parent
@@ -3226,7 +3583,9 @@ end
 
 local function isLootName(instance)
     local name = string.lower(instance.Name)
-    if state.hasLootWord(name, lootNameWords) then
+    local context = getContextName(instance)
+    if state.hasLootWord(name, lootNameWords) or state.hasLootWord(context, lootNameWords)
+        or hasAny(context, {"ammo_", "money_bag", "snake_oil"}) then
         return true
     end
 
@@ -3241,6 +3600,78 @@ local function isLootName(instance)
         end
     end
     return false
+end
+
+state.isLootCategoryEnabled = function(context)
+    context = string.lower(context or "")
+    if hasAny(context, {"money_bag", "money bag", "cash bag"}) then
+        return state.autoCollectMoney
+    elseif hasAny(context, {"bond"}) then
+        return state.autoCollectBonds
+    elseif hasAny(context, {"ammo_", "ammo", "bullet", "cartridge"}) then
+        return state.autoCollectAmmo
+    elseif hasAny(context, gunNameWords) then
+        return state.autoCollectGuns
+    elseif hasAny(context, {"snake_oil", "snake oil", "bandage", "medkit", "medical", "meds"}) then
+        return state.autoCollectMeds
+    end
+    return true
+end
+
+local function findNamedWorkspaceContainer(containerName, cacheKey, scanKey)
+    local cached = state[cacheKey]
+    if cached and cached.Parent then
+        return cached
+    end
+    local lastScan = state[scanKey] or -math.huge
+    if lastScan > 0 and os.clock() - lastScan < 3 then
+        return nil
+    end
+    state[scanKey] = os.clock()
+
+    local direct = Workspace:FindFirstChild(containerName)
+    if direct and (direct:IsA("Folder") or direct:IsA("Model")) then
+        state[cacheKey] = direct
+        return direct
+    end
+
+    local matches = {}
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object.Name == containerName and (object:IsA("Folder") or object:IsA("Model")) then
+            table.insert(matches, object)
+            if #matches > 1 then break end
+        end
+    end
+    if #matches == 1 then
+        state[cacheKey] = matches[1]
+        return matches[1]
+    end
+    return nil
+end
+
+local function getObjectModelsFolder()
+    return findNamedWorkspaceContainer("ObjectModels", "cachedObjectModelsFolder", "objectModelsScanAt")
+end
+
+local function getRuntimeItemsFolder()
+    return findNamedWorkspaceContainer("RuntimeItems", "cachedRuntimeItemsFolder", "runtimeItemsScanAt")
+end
+
+local function findServerEntityOwner(object)
+    local current = object
+    for _ = 1, 12 do
+        if not current or current == Workspace then
+            break
+        end
+        local ok, value = pcall(function()
+            return current:GetAttribute("serverEntity")
+        end)
+        if ok and value ~= nil then
+            return current, value
+        end
+        current = current.Parent
+    end
+    return nil, nil
 end
 
 local function getLootInteraction(instance)
@@ -3316,11 +3747,20 @@ local function getLootCandidate(instance)
     end
 
     local context = getContextName(candidate)
-    if hasAny(context, friendlyWords) or classifyAura(candidate) then
+    if hasAny(context, friendlyWords) or classifyAura(candidate) or not state.isLootCategoryEnabled(context) then
         return nil
     end
 
     local namedLoot = isLootName(candidate) or state.hasLootWord(promptObjectText, lootNameWords)
+    local objectModels = getObjectModelsFolder()
+    local serverOwner, serverEntity = findServerEntityOwner(candidate)
+    local deadRailsItem = objectModels and candidate:IsDescendantOf(objectModels) and serverEntity ~= nil
+    if deadRailsItem then
+        local itemContext = getContextName(serverOwner or candidate)
+        if hasAny(itemContext, {"tutoitem", "worlditem", "lootitem", "pickup", "bond", "ammo", "bandage", "snake_oil", "money_bag"}) then
+            namedLoot = true
+        end
+    end
     local insideLootFolder = isInsideLootFolder(candidate)
     if fromPickupPrompt then
         if not namedLoot and not insideLootFolder then
@@ -3810,7 +4250,99 @@ state.getDeadRailsLootRemote = function(remoteName)
         state.cachedDeadRailsLootRemotes[remoteName] = candidate
         return candidate
     end
+
+    -- Some games keep the same Dead Rails remote names under a different folder.
+    -- Only accept a unique exact-name match; never guess by a partial name.
+    local lastScan = state.deadRailsRemoteScanAt[remoteName] or -math.huge
+    if lastScan > 0 and os.clock() - lastScan < 3 then
+        return nil
+    end
+    state.deadRailsRemoteScanAt[remoteName] = os.clock()
+    local matches = {}
+    for _, object in ipairs(state.replicatedStorage:GetDescendants()) do
+        if object:IsA("RemoteEvent") and object.Name == remoteName then
+            table.insert(matches, object)
+            if #matches > 1 then
+                break
+            end
+        end
+    end
+    if #matches == 1 then
+        state.cachedDeadRailsLootRemotes[remoteName] = matches[1]
+        return matches[1]
+    elseif #matches > 1 then
+        state.currentLootApi = "Ambiguous " .. remoteName .. " remotes"
+    end
     return nil
+end
+
+state.tryDeadRailsRuntimeToolPickup = function(object)
+    if not object or not object.Parent or state.isExcludedLootCandidate(object, "") then
+        return false
+    end
+    local runtimeItems = getRuntimeItemsFolder()
+    if not runtimeItems or not object:IsDescendantOf(runtimeItems) then
+        return false
+    end
+    local pickupRemote = state.getDeadRailsToolRemote("PickUpTool")
+    if not pickupRemote then
+        state.currentLootApi = "PickUpTool remote not found"
+        return false
+    end
+
+    local runtimeItem = object
+    while runtimeItem.Parent and runtimeItem.Parent ~= runtimeItems do
+        runtimeItem = runtimeItem.Parent
+    end
+    local beforeCount = getInventoryItemCount()
+    for attempt = 1, 4 do
+        if not runtimeItem.Parent then
+            state.currentLootApi = "RuntimeItems.PickUpTool (confirmed)"
+            return true
+        end
+        local ok = pcall(function()
+            pickupRemote:FireServer(runtimeItem)
+        end)
+        if not ok then
+            state.currentLootApi = "PickUpTool remote call failed"
+            return false
+        end
+        state.currentLootApi = "RuntimeItems.PickUpTool (attempt " .. attempt .. "/4)"
+        task.wait(0.1)
+        if not runtimeItem.Parent or isPlayerInventoryObject(runtimeItem)
+            or getInventoryItemCount() > beforeCount then
+            state.currentLootApi = "RuntimeItems.PickUpTool (confirmed)"
+            return true
+        end
+    end
+    state.currentLootApi = "RuntimeItems.PickUpTool (unconfirmed)"
+    return false
+end
+
+local function storeAllRuntimeItems()
+    local runtimeItems = getRuntimeItemsFolder()
+    if not runtimeItems then
+        return false, "RuntimeItems folder not found"
+    end
+    local storeRemote = state.getDeadRailsLootRemote("Store")
+    if not storeRemote then
+        return false, "Store remote not found"
+    end
+
+    local sent = 0
+    for _, item in ipairs(runtimeItems:GetChildren()) do
+        local _, serverEntity = findServerEntityOwner(item)
+        if serverEntity ~= nil then
+            local ok = pcall(function()
+                storeRemote:FireServer(serverEntity)
+            end)
+            if ok then
+                sent = sent + 1
+            end
+            task.wait(0.04)
+        end
+    end
+    return sent > 0, string.format("Store requests sent: %d", sent)
 end
 
 state.tryDeadRailsServerPickup = function(object)
@@ -3818,54 +4350,48 @@ state.tryDeadRailsServerPickup = function(object)
         return false
     end
 
-    local objectModels = Workspace:FindFirstChild("ObjectModels")
+    local objectModels = getObjectModelsFolder()
     if not objectModels or not object:IsDescendantOf(objectModels) then
         return false
     end
 
-    local owner = object
-    local serverEntity = nil
-    local current = object
-    for _ = 1, 6 do
-        if not current or current == Workspace then
-            break
-        end
-        local ok, value = pcall(function()
-            return current:GetAttribute("serverEntity")
-        end)
-        if ok and value ~= nil then
-            owner = current
-            serverEntity = value
-            break
-        end
-        current = current.Parent
-    end
+    local owner, serverEntity = findServerEntityOwner(object)
     if serverEntity == nil then
         return false
     end
 
-    local itemName = string.lower(owner.Name)
-    local isWeaponPickup = owner:IsA("Tool") or hasAny(itemName, gunNameWords)
+    local itemContext = string.lower((owner and owner.Name or object.Name) .. " " .. getContextName(owner or object))
+    local isWeaponPickup = (owner and owner:IsA("Tool")) or hasAny(itemContext, gunNameWords)
     local remoteName = isWeaponPickup and "Pickup" or "Actionable"
     local remote = state.getDeadRailsLootRemote(remoteName)
     if not remote then
-        state.currentLootApi = "Visible input (no " .. remoteName .. " remote)"
+        state.currentLootApi = "No unique " .. remoteName .. " remote"
         return false
     end
 
     local beforeCount = getInventoryItemCount()
-    local ok = pcall(function()
-        remote:FireServer(serverEntity)
-    end)
-    if not ok then
-        state.currentLootApi = remoteName .. " remote failed"
-        return false
+    for attempt = 1, 3 do
+        if not object.Parent then
+            state.currentLootApi = "ObjectModels." .. remoteName .. " (confirmed)"
+            return true
+        end
+        local ok = pcall(function()
+            remote:FireServer(serverEntity)
+        end)
+        if not ok then
+            state.currentLootApi = remoteName .. " remote call failed"
+            return false
+        end
+        state.currentLootApi = "ObjectModels." .. remoteName .. " (attempt " .. attempt .. "/3)"
+        task.wait(0.12)
+        if not object.Parent or isPlayerInventoryObject(object)
+            or getInventoryItemCount() > beforeCount then
+            state.currentLootApi = "ObjectModels." .. remoteName .. " (confirmed)"
+            return true
+        end
     end
-
-    state.currentLootApi = "ObjectModels." .. remoteName
-    task.wait(0.15)
-    return not object.Parent or isPlayerInventoryObject(object)
-        or getInventoryItemCount() > beforeCount
+    state.currentLootApi = "ObjectModels." .. remoteName .. " (unconfirmed)"
+    return false
 end
 
 local function collectLootObject(object, root, prompt, clickDetector)
@@ -3876,6 +4402,9 @@ local function collectLootObject(object, root, prompt, clickDetector)
     -- Prefer the Dead Rails-style serverEntity pickup only when the exact
     -- ObjectModels + RemoteEvent structure is present. Otherwise use normal input.
     if state.tryDeadRailsServerPickup(object) then
+        return true
+    end
+    if state.tryDeadRailsRuntimeToolPickup and state.tryDeadRailsRuntimeToolPickup(object) then
         return true
     end
 
@@ -3926,11 +4455,131 @@ local function collectLootObject(object, root, prompt, clickDetector)
     return attempted or clicked
 end
 
+local function buildRuntimeDiagnostics()
+    local lines = {}
+    local function add(value)
+        table.insert(lines, tostring(value))
+    end
+    local function addContainerSample(label, container)
+        add(label .. ": " .. (container and container:GetFullName() or "not found"))
+        if not container then return end
+        local shown = 0
+        for _, child in ipairs(container:GetChildren()) do
+            local _, entityId = findServerEntityOwner(child)
+            add(string.format("  %s | %s | serverEntity=%s | children=%d",
+                child.Name, child.ClassName, tostring(entityId), #child:GetChildren()))
+            shown = shown + 1
+            if shown >= 25 then break end
+        end
+    end
+
+    add("LAST STOP TOOLKIT DIAGNOSTICS / V10.2")
+    add("PlaceId=" .. tostring(game.PlaceId) .. " GameId=" .. tostring(game.GameId))
+    add("JobId=" .. tostring(game.JobId))
+    add("Melee state=" .. tostring(state.killAura) .. " API=" .. tostring(state.currentAuraApi))
+    add("Loot state=" .. tostring(state.autoLoot) .. " API=" .. tostring(state.currentLootApi))
+    add("Gun aim=" .. tostring(state.gunAimAssist) .. " shoot=" .. tostring(state.gunAutoShoot))
+
+    local character = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    add("Character tools:")
+    if character then
+        for _, child in ipairs(character:GetChildren()) do
+            if child:IsA("Tool") then
+                add("  Character/" .. child.Name
+                    .. " | MeleeConfig=" .. tostring(child:FindFirstChild("MeleeWeaponConfiguration", true) ~= nil)
+                    .. " | SwingEvent=" .. tostring(child:FindFirstChild("SwingEvent", true) ~= nil))
+            end
+        end
+    end
+    if backpack then
+        for _, child in ipairs(backpack:GetChildren()) do
+            if child:IsA("Tool") then
+                add("  Backpack/" .. child.Name
+                    .. " | MeleeConfig=" .. tostring(child:FindFirstChild("MeleeWeaponConfiguration", true) ~= nil)
+                    .. " | SwingEvent=" .. tostring(child:FindFirstChild("SwingEvent", true) ~= nil))
+            end
+        end
+    end
+
+    add("Relevant ReplicatedStorage remotes:")
+    local remoteCount = 0
+    for _, object in ipairs(state.replicatedStorage:GetDescendants()) do
+        if object:IsA("RemoteEvent") or object:IsA("RemoteFunction") then
+            local lower = string.lower(object.Name)
+            if hasAny(lower, {"swing", "melee", "attack", "hit", "damage", "shoot", "fire", "reload", "pickup", "drop", "action", "store", "loot", "interact", "weapon"}) then
+                add("  " .. object.ClassName .. " " .. object:GetFullName())
+                remoteCount = remoteCount + 1
+                if remoteCount >= 100 then break end
+            end
+        end
+    end
+    if remoteCount == 0 then add("  none matched") end
+
+    add("Workspace top-level:")
+    for index, child in ipairs(Workspace:GetChildren()) do
+        add("  " .. child.Name .. " | " .. child.ClassName)
+        if index >= 60 then break end
+    end
+    addContainerSample("ObjectModels", getObjectModelsFolder())
+    addContainerSample("RuntimeItems", getRuntimeItemsFolder())
+
+    add("Pickup prompts:")
+    local promptCount = 0
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("ProximityPrompt") then
+            add(string.format("  %s | action=%s | object=%s | enabled=%s",
+                object:GetFullName(), tostring(object.ActionText), tostring(object.ObjectText), tostring(object.Enabled)))
+            promptCount = promptCount + 1
+            if promptCount >= 40 then break end
+        end
+    end
+    if promptCount == 0 then add("  none found") end
+
+    add("NPC sample:")
+    local npcCount = 0
+    for model, kind in pairs(auraCandidates) do
+        if model and model.Parent then
+            local entityName = model:GetAttribute("EntityName")
+            local bounty = model:GetAttribute("Bounty")
+            local health = getTargetHealth(model)
+            add(string.format("  %s | kind=%s | EntityName=%s | Bounty=%s | health=%s",
+                model:GetFullName(), tostring(kind), tostring(entityName), tostring(bounty), tostring(health)))
+            npcCount = npcCount + 1
+            if npcCount >= 30 then break end
+        end
+    end
+    if npcCount == 0 then add("  no aura candidates registered") end
+    return table.concat(lines, "\n")
+end
+
+local function copyRuntimeDiagnostics()
+    local report = buildRuntimeDiagnostics()
+    local clipboard = env.setclipboard or env.toclipboard or env.writeclipboard
+    if type(clipboard) == "function" then
+        local ok = pcall(clipboard, report)
+        if ok then
+            return true, "Diagnostics copied to clipboard"
+        end
+    end
+    print(report)
+    return false, "Clipboard unavailable; diagnostics printed to executor console"
+end
+
 local function runAutoLoot()
     local waitingAtBusForManualUnload = false
 
     while state.running do
         local ok, err = pcall(function()
+            if state.autoEmergencyReturn and not state.manualReturnRequested then
+                local character = LocalPlayer.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.MaxHealth > 0
+                    and humanoid.Health / humanoid.MaxHealth <= 0.35 then
+                    state.manualReturnRequested = true
+                    lootStatus = "Emergency return triggered by low health"
+                end
+            end
             if state.manualReturnRequested then
                 state.manualReturnRequested = false
                 local character = LocalPlayer.Character
@@ -3957,8 +4606,35 @@ local function runAutoLoot()
                 return
             end
 
+            if state.manualDiagnosticsRequested then
+                state.manualDiagnosticsRequested = false
+                local copied, message = copyRuntimeDiagnostics()
+                lootStatus = message
+                task.wait(0.25)
+                return
+            end
+
+            if state.manualStoreRequested then
+                state.manualStoreRequested = false
+                local character = LocalPlayer.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                local bus, busRoot
+                if root then
+                    bus, busRoot = findNearestBus(root.Position)
+                end
+                if not root or not bus or not busRoot or (busRoot.Position - root.Position).Magnitude > 35 then
+                    lootStatus = "Store requires you to stand near the bus"
+                else
+                    local stored, message = storeAllRuntimeItems()
+                    lootStatus = message
+                end
+                task.wait(0.35)
+                return
+            end
+
             if not state.autoLoot then
                 lootStatus = "Off"
+                state.currentLootApi = "Idle (toggle off)"
                 lootCurrentTarget = "--"
                 waitingAtBusForManualUnload = false
                 task.wait(0.25)
@@ -4001,10 +4677,36 @@ local function runAutoLoot()
             if not shouldReturn then
                 target, targetRoot, distance, prompt, clickDetector, lootCoolingDown = findNearestLoot(root.Position, state.lootRange)
             end
+            if not target and not lootCoolingDown and state.autoReturnBus and lootCollectedSinceReturn > 0 then
+                shouldReturn = true
+            end
 
             if target and targetRoot then
                 lootCurrentTarget = target.Name
                 local pickupRange = getLootPickupRange(prompt, clickDetector)
+
+                -- Dead Rails-style ObjectModels/RuntimeItems remotes can collect
+                -- nearby objects without teleporting to each one. Only attempt
+                -- them inside their reference interaction radius.
+                local directCollected = false
+                if distance <= 30 then
+                    directCollected = state.tryDeadRailsServerPickup(target)
+                end
+                if not directCollected and distance <= 10 then
+                    directCollected = state.tryDeadRailsRuntimeToolPickup(target)
+                end
+                if directCollected or not target.Parent then
+                    lootCollected = lootCollected + 1
+                    lootCollectedSinceReturn = lootCollectedSinceReturn + 1
+                    lootFailedAttempts[target] = nil
+                    lootLastAttempt[target] = os.clock() + 999999
+                    state.lootRejected[target] = true
+                    lootCandidates[target] = nil
+                    lootInteractionCache[target] = nil
+                    lootStatus = "Direct pickup confirmed: " .. target.Name
+                    task.wait(0.12)
+                    return
+                end
 
                 if distance > pickupRange then
                     lootStatus = "Teleporting to " .. target.Name
@@ -4075,11 +4777,11 @@ local function runAutoLoot()
                     lootStatus = "Outside safe pickup range; skipped target"
                 end
 
-            elseif lootCoolingDown and lootCollectedSinceReturn <= 0 and not shouldReturn then
+            elseif lootCoolingDown and not shouldReturn then
                 lootStatus = "Waiting for pickup retry"
                 task.wait(0.2)
 
-            elseif state.autoReturnBus and (shouldReturn or lootCollectedSinceReturn > 0) then
+            elseif state.autoReturnBus and shouldReturn then
                 local bus, busRoot, seat = findNearestBus(root.Position)
                 local destination = bus and getBusReturnPosition(bus, busRoot, seat) or nil
                 if bus and destination then
@@ -4093,6 +4795,10 @@ local function runAutoLoot()
                             lootCollectedSinceReturn = 0
                             waitingAtBusForManualUnload = shouldReturn
                             lootStatus = shouldReturn and "At bus - unload inventory manually" or "Returned to bus"
+                            if state.autoStoreAtBus then
+                                local stored, storeMessage = storeAllRuntimeItems()
+                                lootStatus = lootStatus .. " | " .. storeMessage
+                            end
                         else
                             lootStatus = "Bus teleport rejected by server"
                         end
@@ -4101,6 +4807,10 @@ local function runAutoLoot()
                         lootCollectedSinceReturn = 0
                         waitingAtBusForManualUnload = shouldReturn
                         lootStatus = shouldReturn and "At bus - unload inventory manually" or "At bus - sweep complete"
+                        if state.autoStoreAtBus then
+                            local stored, storeMessage = storeAllRuntimeItems()
+                            lootStatus = lootStatus .. " | " .. storeMessage
+                        end
                         task.wait(0.8)
                     end
                 else
@@ -4365,8 +5075,16 @@ local function updateHud()
         healthText = string.format("HP %.0f/%.0f", humanoid.Health, humanoid.MaxHealth)
     end
 
+    local visibleLootCandidates = 0
+    for candidate in pairs(lootCandidates) do
+        if candidate and candidate.Parent and candidate:IsDescendantOf(Workspace) then
+            visibleLootCandidates = visibleLootCandidates + 1
+        end
+    end
+    lootCandidateCount = visibleLootCandidates
+
     hudLabel.Text = string.format(
-        "%s  |  Players %d\nESP: %d  |  NPCs: %d\nMelee: %s  |  Hits: %d  |  Requests: %d\nMelee API: %s\nGun: %s  |  Target: %s\nGun API: %s  |  Inputs: %d  |  Hits: %d  |  Blocked: %d\nLoot: %s  |  Looted: %d  |  TPs: %d\nLoot API: %s\nAttempts: %d  |  Target: %s  |  Candidates: %d",
+        "%s  |  Players %d\nESP: %d  |  NPCs: %d\nMelee: %s  |  Weapon: %s\nMelee API: %s  |  Hits: %d  |  Requests: %d\nGun: %s  |  Target: %s\nGun API: %s  |  Inputs: %d  |  Hits: %d  |  Blocked: %d\nLoot: %s  |  Looted: %d  |  TPs: %d\nLoot API: %s\nAttempts: %d  |  Target: %s  |  Candidates: %d",
         healthText,
         #Players:GetPlayers(),
         lastScanCount,
@@ -4378,9 +5096,10 @@ local function updateHud()
             return count
         end)(),
         currentAuraStatus,
+        currentAuraWeapon,
+        state.currentAuraApi,
         auraConfirmedHits,
         auraAttackAttempts,
-        state.currentAuraApi,
         gunStatus,
         gunTargetName,
         state.currentGunApi,
