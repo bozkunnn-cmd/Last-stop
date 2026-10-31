@@ -6,20 +6,22 @@
       * Loot / pickup ESP (name + distance)
       * Zombie ESP and boss ESP
       * Teammate ESP (off by default)
-      * Optional NPC-only melee auto-attack (off by default)
-      * Local health / player-count / aura-status HUD
+      * Configurable NPC melee auto-attack with broad hostile detection
+      * Local no-clip and walk-speed controls with restoration on unload
+      * Dedicated unload button and local health / player-count / aura HUD
       * Reversible low-effects mode
       * Draggable, collapsible UI
       * RightShift toggles the menu
 
-    The aura only targets detected NPC models, excludes player characters,
-    and uses held mouse input when available (Tool:Activate() fallback).
-    No custom RemoteEvent calls or server-side damage edits are included.
+    The aura excludes player characters and known friendly NPCs. It uses
+    target-screen click pulses, executor click helpers, or Tool:Activate().
+    No guessed RemoteEvent calls or server-side damage edits are included.
 ]]
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
 local CollectionService = game:GetService("CollectionService")
 
@@ -53,9 +55,14 @@ local state = {
     performance = false,
     killAura = false,
     auraBosses = false,
+    auraAllNPCs = false,
+    autoEquipMelee = true,
     auraFace = true,
-    auraRange = 12,
+    auraRange = 16,
     auraInterval = 0.45,
+    noClip = false,
+    walkSpeed = false,
+    walkSpeedValue = 28,
     maxDistance = 1000,
     scanInterval = 2.0,
 }
@@ -65,8 +72,9 @@ local markers = {}
 local auraCandidates = {}
 local auraRegistrationPending = {}
 local currentAuraStatus = "Off"
-local auraInputHeld = false
 local lastAuraAttack = 0
+local noClipCache = {}
+local originalWalkSpeeds = {}
 local visualCache = {}
 local gui
 local mainFrame
@@ -75,6 +83,35 @@ local hudFrame
 local hudLabel
 local lastScanCount = 0
 local originalGlobalShadows = Lighting.GlobalShadows
+
+local function restoreNoClip()
+    for part, oldValue in pairs(noClipCache) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = oldValue
+            end)
+        end
+    end
+    table.clear(noClipCache)
+end
+
+local function restoreWalkSpeed()
+    for humanoid, oldValue in pairs(originalWalkSpeeds) do
+        if humanoid and humanoid.Parent then
+            pcall(function()
+                humanoid.WalkSpeed = oldValue
+            end)
+        end
+    end
+    table.clear(originalWalkSpeeds)
+end
+
+local function restoreMovement()
+    state.noClip = false
+    state.walkSpeed = false
+    restoreNoClip()
+    restoreWalkSpeed()
+end
 
 local function track(connection)
     table.insert(connections, connection)
@@ -182,6 +219,7 @@ local function cleanup()
         setPerformanceMode(false)
     end
 
+    restoreMovement()
     table.clear(auraCandidates)
     table.clear(auraRegistrationPending)
     safeDestroy(gui)
@@ -445,6 +483,11 @@ local function addToggle(labelText, key, description)
             setPerformanceMode(not state.performance)
         else
             state[key] = not state[key]
+            if key == "noClip" and not state.noClip then
+                restoreNoClip()
+            elseif key == "walkSpeed" and not state.walkSpeed then
+                restoreWalkSpeed()
+            end
         end
         refresh()
     end))
@@ -518,7 +561,153 @@ local function addAuraRangeControl()
         refresh()
     end))
     track(plus.MouseButton1Click:Connect(function()
-        state.auraRange = math.min(24, state.auraRange + 2)
+        state.auraRange = math.min(70, state.auraRange + 2)
+        refresh()
+    end))
+end
+
+local function addWalkSpeedControl()
+    layoutOrder = layoutOrder + 1
+    local row = make("Frame", {
+        Name = "WalkSpeedControl",
+        Size = UDim2.new(1, 0, 0, 42),
+        BackgroundColor3 = palette.row,
+        BorderSizePixel = 0,
+        LayoutOrder = layoutOrder,
+    }, content)
+    make("UICorner", {CornerRadius = UDim.new(0, 7)}, row)
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 11, 0, 0),
+        Size = UDim2.new(1, -145, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "Walk speed",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamSemibold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+
+    local valueLabel = make("TextLabel", {
+        Position = UDim2.new(1, -112, 0, 0),
+        Size = UDim2.new(0, 48, 1, 0),
+        BackgroundTransparency = 1,
+        Text = tostring(state.walkSpeedValue),
+        TextColor3 = palette.accent,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Center,
+    }, row)
+
+    local minus = make("TextButton", {
+        Position = UDim2.new(1, -62, 0, 8),
+        Size = UDim2.new(0, 24, 0, 26),
+        BackgroundColor3 = palette.panel,
+        BorderSizePixel = 0,
+        Text = "-",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        AutoButtonColor = false,
+    }, row)
+    make("UICorner", {CornerRadius = UDim.new(0, 5)}, minus)
+
+    local plus = make("TextButton", {
+        Position = UDim2.new(1, -32, 0, 8),
+        Size = UDim2.new(0, 24, 0, 26),
+        BackgroundColor3 = palette.panel,
+        BorderSizePixel = 0,
+        Text = "+",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        AutoButtonColor = false,
+    }, row)
+    make("UICorner", {CornerRadius = UDim.new(0, 5)}, plus)
+
+    local function refresh()
+        valueLabel.Text = tostring(state.walkSpeedValue)
+    end
+
+    track(minus.MouseButton1Click:Connect(function()
+        state.walkSpeedValue = math.max(16, state.walkSpeedValue - 2)
+        refresh()
+    end))
+    track(plus.MouseButton1Click:Connect(function()
+        state.walkSpeedValue = math.min(60, state.walkSpeedValue + 2)
+        refresh()
+    end))
+end
+
+local function addAttackDelayControl()
+    layoutOrder = layoutOrder + 1
+    local row = make("Frame", {
+        Name = "AuraDelayControl",
+        Size = UDim2.new(1, 0, 0, 42),
+        BackgroundColor3 = palette.row,
+        BorderSizePixel = 0,
+        LayoutOrder = layoutOrder,
+    }, content)
+    make("UICorner", {CornerRadius = UDim.new(0, 7)}, row)
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 11, 0, 0),
+        Size = UDim2.new(1, -145, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "Attack delay",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamSemibold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+
+    local valueLabel = make("TextLabel", {
+        Position = UDim2.new(1, -112, 0, 0),
+        Size = UDim2.new(0, 48, 1, 0),
+        BackgroundTransparency = 1,
+        Text = string.format("%.2fs", state.auraInterval),
+        TextColor3 = palette.accent,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Center,
+    }, row)
+
+    local minus = make("TextButton", {
+        Position = UDim2.new(1, -62, 0, 8),
+        Size = UDim2.new(0, 24, 0, 26),
+        BackgroundColor3 = palette.panel,
+        BorderSizePixel = 0,
+        Text = "-",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        AutoButtonColor = false,
+    }, row)
+    make("UICorner", {CornerRadius = UDim.new(0, 5)}, minus)
+
+    local plus = make("TextButton", {
+        Position = UDim2.new(1, -32, 0, 8),
+        Size = UDim2.new(0, 24, 0, 26),
+        BackgroundColor3 = palette.panel,
+        BorderSizePixel = 0,
+        Text = "+",
+        TextColor3 = palette.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        AutoButtonColor = false,
+    }, row)
+    make("UICorner", {CornerRadius = UDim.new(0, 5)}, plus)
+
+    local function refresh()
+        valueLabel.Text = string.format("%.2fs", state.auraInterval)
+    end
+
+    track(minus.MouseButton1Click:Connect(function()
+        state.auraInterval = math.max(0.20, math.floor((state.auraInterval - 0.05) * 100 + 0.5) / 100)
+        refresh()
+    end))
+    track(plus.MouseButton1Click:Connect(function()
+        state.auraInterval = math.min(1.50, math.floor((state.auraInterval + 0.05) * 100 + 0.5) / 100)
         refresh()
     end))
 end
@@ -605,10 +794,18 @@ addToggle("Distance labels", "distance")
 addDistanceControl()
 
 addSection("Combat")
-addToggle("Zombie kill aura", "killAura", "Auto-activates an equipped melee weapon near hostile NPCs")
-addToggle("Include bosses", "auraBosses", "Off by default; enable when you want to fight bosses")
+addToggle("Zombie / enemy kill aura", "killAura", "Repeated attack taps against detected hostile NPCs")
+addToggle("Include bosses", "auraBosses", "Includes Fred, Anubis, Dracula, Crystalus and Juggernaut")
+addToggle("Target unknown NPCs", "auraAllNPCs", "Fallback detection; known friendly NPCs are excluded")
+addToggle("Auto-equip melee", "autoEquipMelee", "Equips an available melee tool when none is equipped")
 addToggle("Auto-face target", "auraFace", "Turns your character toward the nearest valid target")
 addAuraRangeControl()
+addAttackDelayControl()
+
+addSection("Movement")
+addToggle("No clip", "noClip", "Disables character part collisions locally; restores them when off")
+addToggle("Walk speed", "walkSpeed", "Applies the selected local Humanoid speed")
+addWalkSpeedControl()
 
 addSection("Utility")
 addToggle("Status HUD", "hud", "Local health, player count and current ESP marker count")
@@ -628,6 +825,21 @@ make("TextLabel", {
     TextYAlignment = Enum.TextYAlignment.Center,
     LayoutOrder = layoutOrder + 1,
 }, content)
+
+layoutOrder = layoutOrder + 2
+local unloadButton = make("TextButton", {
+    Name = "UnloadScript",
+    Size = UDim2.new(1, 0, 0, 38),
+    BackgroundColor3 = Color3.fromRGB(66, 35, 40),
+    BorderSizePixel = 0,
+    Text = "UNLOAD SCRIPT",
+    TextColor3 = palette.red,
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    AutoButtonColor = false,
+    LayoutOrder = layoutOrder,
+}, content)
+make("UICorner", {CornerRadius = UDim.new(0, 7)}, unloadButton)
 
 -- Small status HUD, separate from the main menu.
 hudFrame = make("Frame", {
@@ -697,6 +909,7 @@ track(minimizeButton.MouseButton1Click:Connect(function()
 end))
 
 track(closeButton.MouseButton1Click:Connect(cleanup))
+track(unloadButton.MouseButton1Click:Connect(cleanup))
 
 track(UserInputService.InputBegan:Connect(function(input, processed)
     if not processed and input.KeyCode == Enum.KeyCode.RightShift then
@@ -705,13 +918,20 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
 end))
 
 local bossWords = {
-    "boss", "fred", "anubis", "dracula", "nightmare", "vampire lord", "overlord"
+    "boss", "fred", "anubis", "dracula", "nightmare", "vampire lord",
+    "overlord", "crystalus", "juggernaut"
 }
 
 local zombieWords = {
     "zombie", "undead", "infected", "ghoul", "skeleton", "vampire",
     "crawler", "walker", "bloater", "brute", "bandit", "raider",
-    "sniper", "alien", "mutant", "monster", "enemy"
+    "sniper", "alien", "mutant", "monster", "enemy", "guard", "soldier",
+    "trooper", "hostile"
+}
+
+local friendlyWords = {
+    "shopkeeper", "doctor", "lumberjack", "trader", "merchant", "vendor",
+    "blacksmith", "quest giver", "questgiver"
 }
 
 local lootWords = {
@@ -736,7 +956,7 @@ end
 local function getContextName(instance)
     local names = {string.lower(instance.Name)}
     local parent = instance.Parent
-    for _ = 1, 2 do
+    for _ = 1, 4 do
         if not parent then
             break
         end
@@ -786,6 +1006,39 @@ local function classify(instance)
 
     if instance:IsA("Model") and instance:FindFirstChildOfClass("Humanoid")
         and hasAny(context, {"npc", "enemy", "hostile"}) then
+        return "zombie"
+    end
+
+    return nil
+end
+
+local function classifyAura(instance)
+    local context = getContextName(instance)
+    if hasAny(context, friendlyWords) then
+        return nil
+    end
+
+    local ok, tags = pcall(function()
+        return CollectionService:GetTags(instance)
+    end)
+    if ok then
+        for _, tag in ipairs(tags) do
+            local tagName = string.lower(tag)
+            if hasAny(tagName, bossWords) then
+                return "boss"
+            elseif hasAny(tagName, zombieWords) then
+                return "zombie"
+            end
+        end
+    end
+
+    if hasAny(context, bossWords) then
+        return "boss"
+    end
+    if hasAny(context, zombieWords) then
+        return "zombie"
+    end
+    if hasAny(context, {"enemies", "hostiles", "zombies", "bandits", "guards", "soldiers", "bosses", "mobs"}) then
         return "zombie"
     end
 
@@ -851,7 +1104,8 @@ local function isMeleeTool(tool)
 
     return hasAny(toolName, {
         "shovel", "sword", "knife", "axe", "machete", "bat", "spear",
-        "club", "crowbar", "pickaxe", "hammer", "melee"
+        "club", "crowbar", "pickaxe", "hammer", "melee", "katana",
+        "scythe", "sledgehammer", "chainsaw", "pipe"
     })
 end
 
@@ -869,8 +1123,72 @@ local function getEquippedMeleeTool(character)
     return nil
 end
 
+local function readToolNumber(tool, key)
+    local ok, attribute = pcall(function()
+        return tool:GetAttribute(key)
+    end)
+    if ok and type(attribute) == "number" then
+        return attribute
+    end
+
+    local valueObject = tool:FindFirstChild(key)
+    if valueObject and (valueObject:IsA("NumberValue") or valueObject:IsA("IntValue")) then
+        return valueObject.Value
+    end
+    return nil
+end
+
+local function getMeleeToolScore(tool)
+    local damage = readToolNumber(tool, "MeleeDamage")
+        or readToolNumber(tool, "Damage")
+        or readToolNumber(tool, "BaseDamage")
+        or readToolNumber(tool, "Power")
+
+    local name = string.lower(tool.Name)
+    local nameScore = 1
+    local priorities = {
+        {"chainsaw", 12}, {"katana", 11}, {"sword", 10}, {"axe", 9},
+        {"machete", 9}, {"spear", 8}, {"pickaxe", 7}, {"crowbar", 7},
+        {"shovel", 6}, {"bat", 6}, {"knife", 5}, {"hammer", 5}
+    }
+    for _, entry in ipairs(priorities) do
+        if string.find(name, entry[1], 1, true) then
+            nameScore = entry[2]
+            break
+        end
+    end
+
+    return (damage or 0) * 100 + nameScore
+end
+
+local function getBestMeleeTool(character)
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local bestTool = nil
+    local bestScore = -math.huge
+
+    local function consider(container)
+        if not container then
+            return
+        end
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("Tool") and isMeleeTool(child) then
+                local score = getMeleeToolScore(child)
+                if score > bestScore then
+                    bestScore = score
+                    bestTool = child
+                end
+            end
+        end
+    end
+
+    consider(character)
+    consider(backpack)
+    return bestTool
+end
+
 local mousePress = env.mouse1press
 local mouseRelease = env.mouse1release
+local mouseClick = env.mouse1click
 if type(mousePress) ~= "function" then
     pcall(function()
         mousePress = mouse1press
@@ -879,6 +1197,11 @@ end
 if type(mouseRelease) ~= "function" then
     pcall(function()
         mouseRelease = mouse1release
+    end)
+end
+if type(mouseClick) ~= "function" then
+    pcall(function()
+        mouseClick = mouse1click
     end)
 end
 
@@ -909,46 +1232,51 @@ local function isPointerOverToolkit()
     return false
 end
 
-local function setAuraAttackHeld(held)
-    if held and isPointerOverToolkit() then
-        if auraInputHeld then
-            setAuraAttackHeld(false)
-        end
+local function performAuraAttack(tool, targetRoot)
+    if not tool or not targetRoot or isPointerOverToolkit() then
         return false
     end
 
-    if auraInputHeld == held then
+    local camera = Workspace.CurrentCamera
+    if virtualInput and camera then
+        local screenPosition, onScreen = camera:WorldToScreenPoint(targetRoot.Position)
+        if onScreen then
+            pcall(function()
+                virtualInput:SendMouseMoveEvent(screenPosition.X, screenPosition.Y, game)
+            end)
+
+            local ok = pcall(function()
+                virtualInput:SendMouseButtonEvent(screenPosition.X, screenPosition.Y, 0, true, game, 0)
+                task.wait(0.04)
+                virtualInput:SendMouseButtonEvent(screenPosition.X, screenPosition.Y, 0, false, game, 0)
+            end)
+            if ok then
+                return true
+            end
+        end
+    end
+
+    local activated = pcall(function()
+        tool:Activate()
+    end)
+    if activated then
         return true
     end
 
-    if type(mousePress) == "function" and type(mouseRelease) == "function" then
-        local ok = pcall(function()
-            if held then
-                mousePress()
-            else
-                mouseRelease()
-            end
-        end)
+    if type(mouseClick) == "function" then
+        local ok = pcall(mouseClick)
         if ok then
-            auraInputHeld = held
             return true
         end
     end
 
-    if virtualInput then
-        local mousePosition = UserInputService:GetMouseLocation()
+    if type(mousePress) == "function" and type(mouseRelease) == "function" then
         local ok = pcall(function()
-            virtualInput:SendMouseButtonEvent(
-                mousePosition.X,
-                mousePosition.Y,
-                0,
-                held,
-                game,
-                0
-            )
+            mousePress()
+            task.wait(0.04)
+            mouseRelease()
         end)
         if ok then
-            auraInputHeld = held
             return true
         end
     end
@@ -956,33 +1284,46 @@ local function setAuraAttackHeld(held)
     return false
 end
 
-local function registerAuraCandidate(instance)
-    if not instance or not instance:IsA("Model") then
-        return
+local function findAuraModel(instance)
+    local current = instance
+
+    while current and current ~= Workspace do
+        if current:IsA("Model") then
+            local humanoid = current:FindFirstChildOfClass("Humanoid")
+            if humanoid and getRootPart(current) then
+                return current
+            end
+        end
+        current = current.Parent
     end
-    if instance:FindFirstAncestorOfClass("Model") or isPlayerCharacter(instance) then
+
+    return nil
+end
+
+local function registerAuraCandidate(instance)
+    local model = findAuraModel(instance)
+    if not model or isPlayerCharacter(model) then
         return
     end
 
-    local humanoid = instance:FindFirstChildOfClass("Humanoid")
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
     if not humanoid then
         return
     end
 
-    local kind = classify(instance)
-    if kind == "zombie" or kind == "boss" then
-        auraCandidates[instance] = kind
-    else
-        auraCandidates[instance] = nil
+    local context = getContextName(model)
+    if hasAny(context, friendlyWords) then
+        auraCandidates[model] = nil
+        return
     end
+
+    auraCandidates[model] = classifyAura(model) or "unknown"
 end
 
 local function queueAuraRegistration(instance)
-    local model
-    if instance:IsA("Model") then
+    local model = findAuraModel(instance)
+    if not model and instance:IsA("Model") then
         model = instance
-    else
-        model = instance:FindFirstAncestorOfClass("Model")
     end
 
     if not model or auraRegistrationPending[model] then
@@ -1004,23 +1345,40 @@ local function getNearestAuraTarget(characterRoot)
     local bestKind = nil
     local bestDistance = state.auraRange
 
-    for model, kind in pairs(auraCandidates) do
+    for model in pairs(auraCandidates) do
         if not model or not model.Parent then
             auraCandidates[model] = nil
         else
             local humanoid = model:FindFirstChildOfClass("Humanoid")
             local root = getRootPart(model)
+            local context = getContextName(model)
 
-            if not humanoid or humanoid.Health <= 0 then
+            if not humanoid or humanoid.Health <= 0 or isPlayerCharacter(model)
+                or hasAny(context, friendlyWords) then
                 auraCandidates[model] = nil
-            elseif root and not isPlayerCharacter(model)
-                and (kind == "zombie" or (kind == "boss" and state.auraBosses)) then
-                local distance = (root.Position - characterRoot.Position).Magnitude
-                if distance <= bestDistance then
-                    bestDistance = distance
-                    bestModel = model
-                    bestRoot = root
-                    bestKind = kind
+            elseif root then
+                local kind = classifyAura(model)
+                if not kind and state.auraAllNPCs then
+                    kind = "unknown"
+                end
+
+                if kind then
+                    auraCandidates[model] = kind
+                    local shouldTarget = kind == "zombie"
+                        or (kind == "boss" and state.auraBosses)
+                        or (kind == "unknown" and state.auraAllNPCs)
+
+                    if shouldTarget then
+                        local distance = (root.Position - characterRoot.Position).Magnitude
+                        if distance <= bestDistance then
+                            bestDistance = distance
+                            bestModel = model
+                            bestRoot = root
+                            bestKind = kind
+                        end
+                    end
+                else
+                    auraCandidates[model] = "unknown"
                 end
             end
         end
@@ -1192,50 +1550,125 @@ local function runKillAura()
             local meleeTool = getEquippedMeleeTool(character)
 
             if not humanoid or humanoid.Health <= 0 or not characterRoot then
-                setAuraAttackHeld(false)
                 currentAuraStatus = "Waiting for respawn"
-            elseif not meleeTool then
-                setAuraAttackHeld(false)
-                currentAuraStatus = "Equip a melee weapon"
             else
-                local target, targetRoot, targetKind, distance = getNearestAuraTarget(characterRoot)
-                if target and targetRoot then
-                    faceAuraTarget(character, targetRoot)
-                    local inputHeld = setAuraAttackHeld(true)
-
-                    if not inputHeld and os.clock() - lastAuraAttack >= state.auraInterval then
-                        local ok, err = pcall(function()
-                            meleeTool:Activate()
+                if not meleeTool and state.autoEquipMelee then
+                    local bestTool = getBestMeleeTool(character)
+                    if bestTool then
+                        pcall(function()
+                            humanoid:EquipTool(bestTool)
                         end)
-                        if ok then
-                            lastAuraAttack = os.clock()
-                        else
-                            currentAuraStatus = "Attack failed: " .. tostring(err):sub(1, 30)
-                        end
+                        task.wait(0.12)
+                        meleeTool = getEquippedMeleeTool(character)
                     end
+                end
 
-                    if inputHeld then
-                        currentAuraStatus = string.format("%s: %s (%.0f)", targetKind, target.Name, distance)
-                    else
-                        currentAuraStatus = string.format("Tap mode: %s (%.0f)", target.Name, distance)
-                    end
+                if not meleeTool then
+                    currentAuraStatus = "Equip or find a melee weapon"
                 else
-                    setAuraAttackHeld(false)
-                    currentAuraStatus = "No hostile in range"
+                    local target, targetRoot, targetKind, distance = getNearestAuraTarget(characterRoot)
+                    if target and targetRoot then
+                        faceAuraTarget(character, targetRoot)
+                        if os.clock() - lastAuraAttack >= state.auraInterval then
+                            local sent = performAuraAttack(meleeTool, targetRoot)
+                            if sent then
+                                lastAuraAttack = os.clock()
+                                currentAuraStatus = string.format("%s: %s (%.0f)", targetKind, target.Name, distance)
+                            else
+                                currentAuraStatus = "Attack input unavailable"
+                            end
+                        else
+                            currentAuraStatus = string.format("Target: %s (%.0f)", target.Name, distance)
+                        end
+                    else
+                        currentAuraStatus = state.auraAllNPCs and "No NPC in range" or "No recognized hostile in range"
+                    end
                 end
             end
         else
-            setAuraAttackHeld(false)
             currentAuraStatus = "Off"
         end
 
-        task.wait(0.1)
+        task.wait(0.08)
     end
-
-    setAuraAttackHeld(false)
 end
 
 task.spawn(runKillAura)
+
+local function applyNoClip()
+    if not state.noClip then
+        if next(noClipCache) then
+            restoreNoClip()
+        end
+        return
+    end
+
+    local character = LocalPlayer.Character
+    if not character then
+        return
+    end
+
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("BasePart") then
+            if noClipCache[object] == nil then
+                noClipCache[object] = object.CanCollide
+            end
+            if object.CanCollide then
+                object.CanCollide = false
+            end
+        end
+    end
+end
+
+local function applyWalkSpeed()
+    if not state.walkSpeed then
+        if next(originalWalkSpeeds) then
+            restoreWalkSpeed()
+        end
+        return
+    end
+
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then
+        return
+    end
+
+    if originalWalkSpeeds[humanoid] == nil then
+        originalWalkSpeeds[humanoid] = humanoid.WalkSpeed
+    end
+
+    if humanoid.WalkSpeed ~= state.walkSpeedValue then
+        pcall(function()
+            humanoid.WalkSpeed = state.walkSpeedValue
+        end)
+    end
+end
+
+track(RunService.Stepped:Connect(function()
+    if state.running and state.noClip then
+        applyNoClip()
+    elseif next(noClipCache) then
+        restoreNoClip()
+    end
+end))
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+    restoreNoClip()
+    restoreWalkSpeed()
+end))
+
+task.spawn(function()
+    while state.running do
+        if state.walkSpeed then
+            applyWalkSpeed()
+        elseif next(originalWalkSpeeds) then
+            restoreWalkSpeed()
+        end
+        task.wait(0.15)
+    end
+    restoreWalkSpeed()
+end)
 
 local function scanWorld()
     local camera = Workspace.CurrentCamera
@@ -1337,10 +1770,17 @@ local function updateHud()
     end
 
     hudLabel.Text = string.format(
-        "%s  |  Players %d\nESP: %d  |  Aura: %s",
+        "%s  |  Players %d\nESP: %d  |  NPC cache: %d  |  Aura: %s",
         healthText,
         #Players:GetPlayers(),
         lastScanCount,
+        (function()
+            local count = 0
+            for _ in pairs(auraCandidates) do
+                count = count + 1
+            end
+            return count
+        end)(),
         currentAuraStatus
     )
 end
