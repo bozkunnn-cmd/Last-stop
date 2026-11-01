@@ -1,5 +1,5 @@
 --[[
-    LAST STOP [BETA] - ROADSIDE TOOLKIT v10.3
+    LAST STOP [BETA] - ROADSIDE TOOLKIT v10.4
     Client-side survival toolkit.
 
     Included:
@@ -19,7 +19,7 @@
     Uses Last Stop's observed ENTITY_CONTAINER / ITEM_CONTAINER hierarchy and
     Knit service discovery. Dead Rails APIs are treated as optional references only;
     no remote is invoked unless its exact protocol is independently verified.
-    Melee input and click-to-grab remain subject to the game's own hit validation.
+    Melee input remains subject to server hit validation; Last Stop pickup uses its visible F / Pick Up action.
 ]]
 
 local Players = game:GetService("Players")
@@ -71,6 +71,9 @@ local state = {
     itemContainerScanAt = 0,
     lastDamageEventSummary = "No DamageDealt event observed yet",
     lastProjectileEventSummary = "No ProjectileHit event observed yet",
+    lastEntityKilledSummary = "No EntityKilled event observed yet",
+    lastMethodCalledSummary = "No MethodCalled event observed yet",
+    lastInventoryChangedSummary = "No InventoryChanged event observed yet",
     entityContextCache = setmetatable({}, {__mode = "k"}),
     entityContextCacheAt = setmetatable({}, {__mode = "k"}),
     entityRigCache = setmetatable({}, {__mode = "k"}),
@@ -452,7 +455,7 @@ make("TextLabel", {
     Position = UDim2.new(0, 14, 0, 27),
     Size = UDim2.new(1, -105, 0, 13),
     BackgroundTransparency = 1,
-    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V10.3",
+    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V10.4",
     TextColor3 = palette.muted,
     Font = Enum.Font.Gotham,
     TextSize = 9,
@@ -1174,7 +1177,7 @@ addToggle("Distance labels", "distance")
 addDistanceControl()
 
 addSection("Combat")
-addToggle("Zombie / enemy kill aura", "killAura", "Targets live NPC rigs and sends normal Swing input; never chases")
+addToggle("Zombie / enemy kill aura", "killAura", "Automates normal Swing input; no verified long-range melee remote")
 addToggle("Include bosses", "auraBosses", "Includes Fred, Anubis, Dracula, Crystalus and Juggernaut")
 addToggle("Target unknown NPCs", "auraAllNPCs", "Fallback detection; known friendly NPCs are excluded")
 addToggle("Auto-equip melee", "autoEquipMelee", "Equips an available melee tool when none is equipped")
@@ -1188,7 +1191,7 @@ addAuraRangeControl()
 addAttackDelayControl()
 
 addSection("Automation")
-addToggle("Auto loot nearby items", "autoLoot", "Scans Last Stop ITEM_CONTAINER and uses normal click-to-grab")
+addToggle("Auto loot nearby items", "autoLoot", "Scans GUID-named ITEM_CONTAINER Tools and presses F / Pick Up")
 addToggle("Return to bus when done", "autoReturnBus", "Teleports back after a loot sweep or inventory threshold")
 addToggle("Auto-store at bus", "autoStoreAtBus", "Disabled until Last Stop StoreItem argument contract is verified")
 addToggle("Emergency return below 35% HP", "autoEmergencyReturn", "Requests a bus return when health falls below 35 percent")
@@ -1563,19 +1566,93 @@ state.getEntityRigEvidence = function(model)
     return motorCount, ballSocketCount, animatorCount, playingTrackCount
 end
 
-state.getItemIdentityText = function(object)
-    if not object then return "" end
-    local values = {string.lower(object.Name)}
-    for _, attributeName in ipairs({"ItemName", "DisplayName", "WeaponName", "ItemType", "WeaponType", "ToolType", "Type"}) do
+state.isGuidLikeName = function(value)
+    if type(value) ~= "string" then return false end
+    local compact = string.gsub(value, "[%-%{%}]", "")
+    return #compact >= 24 and string.match(compact, "^[%x]+$") ~= nil
+end
+
+state.cleanDisplayValue = function(value)
+    if type(value) ~= "string" then return nil end
+    value = string.gsub(value, "^%s+", "")
+    value = string.gsub(value, "%s+$", "")
+    if value == "" or #value > 56 or state.isGuidLikeName(value) then return nil end
+    local lower = string.lower(value)
+    if lower == "handle" or lower == "configuration" or lower == "promptpart"
+        or lower == "attachment" or lower == "model" or lower == "meshpart"
+        or lower == "tool" or lower == "data" or lower == "part"
+        or lower == "basepart" or lower == "unionoperation" or lower == "folder" then return nil end
+    return value
+end
+
+state.getItemDisplayName = function(object)
+    if not object then return "Unknown item" end
+    if object:IsA("Tool") then
+        local ok, tooltip = pcall(function() return object.ToolTip end)
+        local cleaned = ok and state.cleanDisplayValue(tooltip) or nil
+        if cleaned then return cleaned end
+    end
+    for _, attributeName in ipairs({"DisplayName", "ItemName", "WeaponName", "ItemType", "ToolType", "Type", "DisplayText", "Title"}) do
         local ok, value = pcall(function() return object:GetAttribute(attributeName) end)
-        if ok and type(value) == "string" and value ~= "" then
-            table.insert(values, string.lower(value))
+        local cleaned = ok and state.cleanDisplayValue(value) or nil
+        if cleaned then return cleaned end
+    end
+    local descendants = {}
+    pcall(function() descendants = object:GetDescendants() end)
+    local preferredNames = {"displayname", "itemname", "weaponname", "itemtype", "tooltype", "displaytext", "title", "name"}
+    for _, wanted in ipairs(preferredNames) do
+        for _, child in ipairs(descendants) do
+            if string.lower(child.Name) == wanted and child:IsA("StringValue") then
+                local cleaned = state.cleanDisplayValue(child.Value)
+                if cleaned then return cleaned end
+            end
         end
     end
-    for _, child in ipairs(object:GetChildren()) do
-        if child:IsA("StringValue") and hasAny(string.lower(child.Name), {"name", "type", "item", "weapon"}) then
-            table.insert(values, string.lower(child.Value))
+    for _, child in ipairs(descendants) do
+        if child:IsA("StringValue") then
+            local cleaned = state.cleanDisplayValue(child.Value)
+            if cleaned then return cleaned end
         end
+    end
+    for _, child in ipairs(descendants) do
+        local cleaned = state.cleanDisplayValue(child.Name)
+        if cleaned then return cleaned end
+    end
+    return state.cleanDisplayValue(object.Name) or "Loot item"
+end
+
+state.getItemIdentityText = function(object)
+    if not object then return "" end
+    local values, seen = {}, {}
+    local function add(value)
+        local cleaned = state.cleanDisplayValue(value)
+        if cleaned then
+            local lower = string.lower(cleaned)
+            if not seen[lower] then
+                seen[lower] = true
+                table.insert(values, lower)
+            end
+        end
+    end
+    add(object.Name)
+    if object:IsA("Tool") then pcall(function() add(object.ToolTip) end) end
+    local attributeOk, attributes = pcall(function() return object:GetAttributes() end)
+    if attributeOk and type(attributes) == "table" then
+        for key, value in pairs(attributes) do
+            if hasAny(string.lower(tostring(key)), {"name", "type", "item", "weapon", "display", "title"}) then add(value) end
+        end
+    end
+    local descendants = {}
+    pcall(function() descendants = object:GetDescendants() end)
+    for index, child in ipairs(descendants) do
+        if child:IsA("StringValue") then add(child.Value) end
+        local ok, childAttributes = pcall(function() return child:GetAttributes() end)
+        if ok and type(childAttributes) == "table" then
+            for key, value in pairs(childAttributes) do
+                if hasAny(string.lower(tostring(key)), {"name", "type", "item", "weapon", "display", "title"}) then add(value) end
+            end
+        end
+        if index >= 48 then break end
     end
     return table.concat(values, " ")
 end
@@ -1719,9 +1796,11 @@ local function getRootPart(instance)
 
     if instance:IsA("Tool") then
         local handle = instance:FindFirstChild("Handle")
-        if handle and handle:IsA("BasePart") then
-            return handle
-        end
+        if handle and handle:IsA("BasePart") then return handle end
+        local directPart = instance:FindFirstChildWhichIsA("BasePart")
+        if directPart then return directPart end
+        -- Last Stop world Tools may wrap their physical part inside a Folder/Model.
+        return instance:FindFirstChildWhichIsA("BasePart", true)
     end
 
     if instance:IsA("Model") then
@@ -2759,7 +2838,7 @@ local function getMarkerColor(kind, instance)
         return Color3.fromRGB(90, 170, 255)
     end
 
-    local name = string.lower(instance.Name)
+    local name = string.lower(state.getItemIdentityText(instance))
     if hasAny(name, {"key", "cure", "quest", "potion"}) then
         return Color3.fromRGB(190, 125, 255)
     elseif hasAny(name, {"ammo", "weapon", "gun", "rifle", "pistol"}) then
@@ -3748,8 +3827,8 @@ end
 
 task.spawn(runGunAssist)
 
--- Auto-loot uses the game's visible pickup interactions (prompts, click detectors,
--- or the documented click-to-grab action). It does not guess or invoke game remotes.
+-- Auto-loot uses the game's visible pickup interactions (ProximityPrompts,
+-- ClickDetectors, and Last Stop's F / Pick Up key). It does not guess remotes.
 local lootNameWords = {
     "gascan", "gas can", "gasoline", "fuel", "coal", "wood", "scrap",
     "duct tape", "tape", "spring", "metal pipe", "pipe", "ammo", "bullet",
@@ -4030,9 +4109,8 @@ local function getLootCandidate(instance)
     end
 
     local itemContainerRoot = state.getTopLevelItemContainerObject(instance)
-    if itemContainerRoot then
-        candidate = itemContainerRoot
-    end
+    local isLastStopItem = itemContainerRoot ~= nil
+    if itemContainerRoot then candidate = itemContainerRoot end
 
     if not candidate or not candidate.Parent or not candidate:IsDescendantOf(Workspace)
         or isPlayerInventoryObject(candidate) or isPlayerCharacter(candidate)
@@ -4040,14 +4118,20 @@ local function getLootCandidate(instance)
         return nil
     end
 
-    if state.isExcludedLootCandidate(candidate, promptObjectText) then
+    local identityText = state.getItemIdentityText(candidate)
+    if state.isExcludedLootCandidate(candidate, (promptObjectText or "") .. " " .. identityText) then
         return nil
     end
 
-    local context = getContextName(candidate)
-    if hasAny(context, friendlyWords) or classifyAura(candidate) or not state.isLootCategoryEnabled(context) then
+    local context = getContextName(candidate) .. " " .. identityText
+    if hasAny(context, friendlyWords) or not state.isLootCategoryEnabled(context) then
         return nil
     end
+
+    -- ITEM_CONTAINER is Last Stop's confirmed world-item root. Its direct
+    -- Tool/Model children are GUID-named, so they must not depend on name matching.
+    if isLastStopItem then return candidate end
+    if classifyAura(candidate) then return nil end
 
     local namedLoot = isLootName(candidate) or state.hasLootWord(promptObjectText, lootNameWords)
     local objectModels = getObjectModelsFolder()
@@ -4396,11 +4480,10 @@ local function teleportNearLoot(root, target, targetRoot, pickupRange)
     end
 
     local horizontalRadius = math.max(boundsSize.X, boundsSize.Z) * 0.5
-    local offset = math.max(3.25, horizontalRadius + 2.0)
     local maxOffset = math.max(2.5, pickupRange - 1.25)
-    if offset > maxOffset then
-        return false
-    end
+    local desiredOffset = math.max(3.0, horizontalRadius + 1.0)
+    local offset = math.min(desiredOffset, maxOffset)
+    if maxOffset < 2.5 then return false end
 
     local baseDirection = away.Unit
     local directions = {
@@ -4705,50 +4788,47 @@ state.tryDeadRailsServerPickup = function(object)
     return false
 end
 
+state.pressPickupKey = function()
+    if virtualInput then
+        local downOk = pcall(function() virtualInput:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
+        if not downOk then return false end
+        task.wait(0.08)
+        local upOk = pcall(function() virtualInput:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+        return upOk
+    end
+    local keyDown = env.keypress or keypress
+    local keyUp = env.keyrelease or keyrelease
+    if type(keyDown) == "function" and type(keyUp) == "function" then
+        local downOk = pcall(keyDown, 0x46)
+        task.wait(0.08)
+        local upOk = pcall(keyUp, 0x46)
+        return downOk and upOk
+    end
+    return false
+end
+
 local function collectLootObject(object, root, prompt, clickDetector)
-    if not object or not object.Parent then
-        return false
-    end
-
-    -- Last Stop's ITEM_CONTAINER uses the visible click-to-grab action. The
-    -- Dead Rails serverEntity adapters are gated off for this universe.
-    if state.tryDeadRailsServerPickup(object) then
-        return true
-    end
-    if state.tryDeadRailsRuntimeToolPickup and state.tryDeadRailsRuntimeToolPickup(object) then
-        return true
-    end
-
+    if not object or not object.Parent then return false end
     local attempted = false
+
     if prompt and prompt.Parent and prompt.Enabled then
         if type(fireproximityprompt) == "function" then
             local ok = pcall(fireproximityprompt, prompt)
             attempted = attempted or ok
             task.wait(0.08)
-            if not object.Parent or isPlayerInventoryObject(object) then
-                return true
-            end
+            if not object.Parent or isPlayerInventoryObject(object) then return true end
         end
-
         if prompt.Parent and prompt.Enabled then
-            local began = pcall(function()
-                prompt:InputHoldBegin()
-            end)
+            local began = pcall(function() prompt:InputHoldBegin() end)
             if began then
                 attempted = true
                 local holdDuration = 0
-                pcall(function()
-                    holdDuration = prompt.HoldDuration
-                end)
+                pcall(function() holdDuration = prompt.HoldDuration end)
                 task.wait(math.max(0.05, math.min(holdDuration, 5.0)))
-                local ended = pcall(function()
-                    prompt:InputHoldEnd()
-                end)
+                local ended = pcall(function() prompt:InputHoldEnd() end)
                 attempted = attempted or ended
                 task.wait(0.08)
-                if not object.Parent or isPlayerInventoryObject(object) then
-                    return true
-                end
+                if not object.Parent or isPlayerInventoryObject(object) then return true end
             end
         end
     end
@@ -4757,13 +4837,16 @@ local function collectLootObject(object, root, prompt, clickDetector)
         local ok = pcall(fireclickdetector, clickDetector)
         attempted = attempted or ok
         task.wait(0.08)
-        if not object.Parent or isPlayerInventoryObject(object) then
-            return true
-        end
+        if not object.Parent or isPlayerInventoryObject(object) then return true end
     end
 
-    local clicked = clickWorldObject(root)
-    return attempted or clicked
+    if game.GameId == 10759337137 then
+        -- The visible Last Stop prompt says F / Pick Up. Left mouse is a
+        -- separate Grab action, so use the actual pickup key instead of clicking.
+        if root and root.Parent then aimLootCamera(root); task.wait(0.05) end
+        return attempted or state.pressPickupKey()
+    end
+    return attempted or clickWorldObject(root)
 end
 
 state.summarizeObservedPayload = function(...)
@@ -4820,7 +4903,10 @@ state.connectLastStopTelemetry = function(serviceName, groupName, remoteName, st
 end
 
 state.connectLastStopTelemetry("DamageService", "RE", "DamageDealt", "lastDamageEventSummary")
+state.connectLastStopTelemetry("DamageService", "RE", "EntityKilled", "lastEntityKilledSummary")
 state.connectLastStopTelemetry("ProjectileService", "RE", "ProjectileHit", "lastProjectileEventSummary")
+state.connectLastStopTelemetry("MethodService", "RE", "MethodCalled", "lastMethodCalledSummary")
+state.connectLastStopTelemetry("ItemService", "RE", "InventoryChanged", "lastInventoryChangedSummary")
 
 local function buildRuntimeDiagnostics()
     local lines = {}
@@ -4833,14 +4919,44 @@ local function buildRuntimeDiagnostics()
         local shown = 0
         for _, child in ipairs(container:GetChildren()) do
             local _, entityId = findServerEntityOwner(child)
-            add(string.format("  %s | %s | serverEntity=%s | children=%d",
-                child.Name, child.ClassName, tostring(entityId), #child:GetChildren()))
+            local displayName = state.getItemDisplayName(child)
+            local tooltip = ""
+            if child:IsA("Tool") then pcall(function() tooltip = child.ToolTip end) end
+            local childSummary = {}
+            for _, sub in ipairs(child:GetChildren()) do
+                table.insert(childSummary, sub.Name .. ":" .. sub.ClassName)
+                if #childSummary >= 8 then break end
+            end
+            local descendantSummary = {}
+            local descOk, childDescendants = pcall(function() return child:GetDescendants() end)
+            if descOk then
+                for _, sub in ipairs(childDescendants) do
+                    local extra = sub.Name .. ":" .. sub.ClassName
+                    if sub:IsA("StringValue") then extra = extra .. "=" .. tostring(sub.Value):sub(1, 24) end
+                    table.insert(descendantSummary, extra)
+                    if #descendantSummary >= 14 then break end
+                end
+            end
+            local attributes = {}
+            local attrOk, attrValues = pcall(function() return child:GetAttributes() end)
+            if attrOk and type(attrValues) == "table" then
+                for key, value in pairs(attrValues) do
+                    table.insert(attributes, tostring(key) .. "=" .. tostring(value):sub(1, 32))
+                    if #attributes >= 8 then break end
+                end
+            end
+            local part = getRootPart(child)
+            add(string.format("  %s | %s | display=%s | tooltip=%s | root=%s | serverEntity=%s | children=%s | attrs=%s",
+                child.Name, child.ClassName, displayName, tostring(tooltip),
+                part and (part.Name .. ":" .. tostring(part.Size)) or "nil", tostring(entityId),
+                table.concat(childSummary, ","), table.concat(attributes, ",")))
+            if #descendantSummary > 0 then add("    descendants=" .. table.concat(descendantSummary, ",")) end
             shown = shown + 1
             if shown >= 25 then break end
         end
     end
 
-    add("LAST STOP TOOLKIT DIAGNOSTICS / V10.3")
+    add("LAST STOP TOOLKIT DIAGNOSTICS / V10.4")
     add("PlaceId=" .. tostring(game.PlaceId) .. " GameId=" .. tostring(game.GameId))
     add("Last Stop universe match=" .. tostring(game.GameId == 10759337137))
     add("JobId=" .. tostring(game.JobId))
@@ -4943,6 +5059,9 @@ local function buildRuntimeDiagnostics()
         end
     end
     add("Observed DamageDealt payload: " .. tostring(state.lastDamageEventSummary))
+    add("Observed EntityKilled payload: " .. tostring(state.lastEntityKilledSummary))
+    add("Observed MethodCalled payload: " .. tostring(state.lastMethodCalledSummary))
+    add("Observed InventoryChanged payload: " .. tostring(state.lastInventoryChangedSummary))
     add("Observed ProjectileHit payload: " .. tostring(state.lastProjectileEventSummary))
 
     add("Pickup prompts:")
@@ -4989,8 +5108,20 @@ local function copyRuntimeDiagnostics()
     return false, "Clipboard unavailable; diagnostics printed to executor console"
 end
 
+state.refreshLastStopLootCandidates = function()
+    local container = state.getItemContainerFolder()
+    if not container then return end
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Tool") or child:IsA("Model") or child:IsA("BasePart") then
+            local candidate = getLootCandidate(child)
+            if candidate then lootCandidates[candidate] = true end
+        end
+    end
+end
+
 local function runAutoLoot()
     local waitingAtBusForManualUnload = false
+    local lastContainerRefresh = 0
 
     while state.running do
         local ok, err = pcall(function()
@@ -5064,6 +5195,11 @@ local function runAutoLoot()
                 return
             end
 
+            if game.GameId == 10759337137 and state.autoLoot and os.clock() - lastContainerRefresh >= 0.5 then
+                lastContainerRefresh = os.clock()
+                state.refreshLastStopLootCandidates()
+            end
+
             if (state.killAura and combatTargetActive) or ((state.gunAimAssist or state.gunAutoShoot) and gunTargetActive) then
                 lootStatus = "Paused for combat"
                 lootCurrentTarget = state.killAura and currentAuraTargetName or gunTargetName
@@ -5071,7 +5207,7 @@ local function runAutoLoot()
                 return
             end
 
-            state.currentLootApi = "Last Stop ITEM_CONTAINER / click-to-grab"
+            state.currentLootApi = "Last Stop ITEM_CONTAINER / F Pick Up"
             local character = LocalPlayer.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -5106,13 +5242,13 @@ local function runAutoLoot()
             end
 
             if target and targetRoot then
-                lootCurrentTarget = target.Name
-                state.currentLootApi = "Last Stop ITEM_CONTAINER / click-to-grab"
+                lootCurrentTarget = state.getItemDisplayName(target)
+                state.currentLootApi = "Last Stop ITEM_CONTAINER / F Pick Up"
                 local pickupRange = getLootPickupRange(prompt, clickDetector)
 
                 -- Dead Rails remote adapters are intentionally disabled in the
                 -- Last Stop universe. They remain only as optional references for
-                -- other games; Last Stop uses ITEM_CONTAINER click-to-grab input.
+                -- other games; Last Stop uses ITEM_CONTAINER and the visible F pickup input.
                 local directCollected = false
                 if game.GameId ~= 10759337137 then
                     if distance <= 30 then
@@ -5130,13 +5266,13 @@ local function runAutoLoot()
                     state.lootRejected[target] = true
                     lootCandidates[target] = nil
                     lootInteractionCache[target] = nil
-                    lootStatus = "Direct pickup confirmed: " .. target.Name
+                    lootStatus = "Direct pickup confirmed: " .. state.getItemDisplayName(target)
                     task.wait(0.12)
                     return
                 end
 
                 if distance > pickupRange then
-                    lootStatus = "Teleporting to " .. target.Name
+                    lootStatus = "Teleporting to " .. state.getItemDisplayName(target)
                     local teleported = teleportNearLoot(root, target, targetRoot, pickupRange)
                     if teleported then
                         lootTeleports = lootTeleports + 1
@@ -5180,7 +5316,7 @@ local function runAutoLoot()
                         state.lootRejected[target] = true
                         lootCandidates[target] = nil
                         lootInteractionCache[target] = nil
-                        lootStatus = "Collected " .. target.Name
+                        lootStatus = "Collected " .. state.getItemDisplayName(target)
                     else
                         local failures = (lootFailedAttempts[target] or 0) + 1
                         lootFailedAttempts[target] = failures
@@ -5188,11 +5324,11 @@ local function runAutoLoot()
                         if failures >= 2 then
                             lootCandidates[target] = nil
                             state.lootRejected[target] = true
-                            lootStatus = "Pickup failed twice; skipped " .. target.Name
+                            lootStatus = "Pickup failed twice; skipped " .. state.getItemDisplayName(target)
                         elseif not interacted then
-                            lootStatus = "No pickup input; retrying " .. target.Name
+                            lootStatus = "No F pickup input; retrying " .. state.getItemDisplayName(target)
                         else
-                            lootStatus = "Pickup unconfirmed; retrying " .. target.Name
+                            lootStatus = "Pickup unconfirmed; retrying " .. state.getItemDisplayName(target)
                         end
                     end
                 else
@@ -5440,15 +5576,14 @@ local function scanWorld()
                         seen[instance] = true
                         count = count + 1
 
+                        local displayName = kind == "loot"
+                            and state.getItemDisplayName(instance) or instance.Name
                         if not markers[instance] then
-                            local displayName = instance.Name
                             local marker = createMarker(instance, kind, displayName)
-                            if marker then
-                                markers[instance] = marker
-                            end
+                            if marker then markers[instance] = marker end
                         else
                             markers[instance].kind = kind
-                            markers[instance].displayName = instance.Name
+                            markers[instance].displayName = displayName
                         end
                     end
                 end
