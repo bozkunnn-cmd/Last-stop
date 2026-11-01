@@ -1,5 +1,5 @@
 --[[
-    LAST STOP [BETA] - ROADSIDE TOOLKIT v10.5
+    LAST STOP [BETA] - ROADSIDE TOOLKIT v10.6
     Client-side survival toolkit.
 
     Included:
@@ -11,7 +11,9 @@
       * Teleport-assisted loot pickup and return-to-bus navigation
       * Local no-clip and walk-speed controls with restoration on unload
       * Dedicated unload button and local health / player-count / aura HUD
-      * Reversible low-effects mode
+      * Reversible low-effects mode and Fullbright lighting toggle
+      * Safe one-shot emergency return to the bus perimeter
+      * Bus contents, wheels, planters and cooking equipment excluded from loot
       * Draggable, collapsible UI
       * RightShift toggles the menu
 
@@ -84,6 +86,8 @@ local state = {
     lastLootFeatureGrabCount = 0,
     lastLootRegisteredCount = 0,
     lastLootInRangeCount = 0,
+    lastLootBusExcludedCount = 0,
+    lastLootFeatureExcludedCount = 0,
     entityContextCache = setmetatable({}, {__mode = "k"}),
     entityContextCacheAt = setmetatable({}, {__mode = "k"}),
     entityRigCache = setmetatable({}, {__mode = "k"}),
@@ -96,6 +100,7 @@ local state = {
     distance = true,
     hud = true,
     performance = false,
+    fullbright = false,
     killAura = false,
     auraBosses = false,
     auraAllNPCs = false,
@@ -119,6 +124,9 @@ local state = {
     autoReturnBus = true,
     autoStoreAtBus = false,
     autoEmergencyReturn = false,
+    emergencyReturnLatched = false,
+    lastEmergencyReturnAt = 0,
+    manualReturnReason = nil,
     autoCollectMoney = true,
     autoCollectBonds = true,
     autoCollectAmmo = true,
@@ -132,7 +140,7 @@ local state = {
     deadAuraBlacklist = setmetatable({}, {__mode = "k"}),
     auraDeathConnections = setmetatable({}, {__mode = "k"}),
     lootRejected = setmetatable({}, {__mode = "k"}),
-    lootRange = 80,
+    lootRange = 250,
     lootReturnThreshold = 9,
     noClip = false,
     walkSpeed = false,
@@ -260,6 +268,44 @@ local function disableEffect(object)
     end)
 end
 
+state.setFullbright = function(enabled)
+    state.fullbright = enabled
+
+    local properties = {
+        "Brightness", "ClockTime", "Ambient", "OutdoorAmbient", "FogEnd",
+        "ExposureCompensation", "EnvironmentDiffuseScale", "EnvironmentSpecularScale",
+    }
+
+    if enabled then
+        if not state.fullbrightOriginal then
+            state.fullbrightOriginal = {}
+            for _, property in ipairs(properties) do
+                local ok, value = pcall(function() return Lighting[property] end)
+                if ok then state.fullbrightOriginal[property] = value end
+            end
+        end
+
+        local brightSettings = {
+            Brightness = 3,
+            ClockTime = 14,
+            Ambient = Color3.fromRGB(190, 190, 190),
+            OutdoorAmbient = Color3.fromRGB(190, 190, 190),
+            FogEnd = 100000,
+            ExposureCompensation = 0.25,
+            EnvironmentDiffuseScale = 1,
+            EnvironmentSpecularScale = 1,
+        }
+        for property, value in pairs(brightSettings) do
+            pcall(function() Lighting[property] = value end)
+        end
+    elseif state.fullbrightOriginal then
+        for property, value in pairs(state.fullbrightOriginal) do
+            pcall(function() Lighting[property] = value end)
+        end
+        state.fullbrightOriginal = nil
+    end
+end
+
 local function setPerformanceMode(enabled)
     state.performance = enabled
 
@@ -335,6 +381,9 @@ local function cleanup()
 
     if state.performance then
         setPerformanceMode(false)
+    end
+    if state.fullbright then
+        state.setFullbright(false)
     end
 
     restoreMovement()
@@ -466,7 +515,7 @@ make("TextLabel", {
     Position = UDim2.new(0, 14, 0, 27),
     Size = UDim2.new(1, -105, 0, 13),
     BackgroundTransparency = 1,
-    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V10.5",
+    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V10.6",
     TextColor3 = palette.muted,
     Font = Enum.Font.Gotham,
     TextSize = 9,
@@ -623,9 +672,14 @@ local function addToggle(labelText, key, description)
     track(row.MouseButton1Click:Connect(function()
         if key == "performance" then
             setPerformanceMode(not state.performance)
+        elseif key == "fullbright" then
+            state.setFullbright(not state.fullbright)
         else
             state[key] = not state[key]
-            if key == "noClip" then
+            if key == "autoEmergencyReturn" and not state.autoEmergencyReturn then
+                state.emergencyReturnLatched = false
+                state.lastEmergencyReturnAt = 0
+            elseif key == "noClip" then
                 if state.noClip then
                     if primeNoClipCallback then
                         primeNoClipCallback()
@@ -878,11 +932,11 @@ local function addLootRangeControl()
     end
 
     track(minus.MouseButton1Click:Connect(function()
-        state.lootRange = math.max(20, state.lootRange - 10)
+        state.lootRange = math.max(50, state.lootRange - 25)
         refresh()
     end))
     track(plus.MouseButton1Click:Connect(function()
-        state.lootRange = math.min(300, state.lootRange + 10)
+        state.lootRange = math.min(1000, state.lootRange + 25)
         refresh()
     end))
 end
@@ -1185,6 +1239,7 @@ addToggle("Zombies / enemies", "zombies")
 addToggle("Bosses", "bosses")
 addToggle("Teammates", "players")
 addToggle("Distance labels", "distance")
+addToggle("Fullbright", "fullbright", "Brightens dark areas; restores original lighting when disabled or unloaded")
 addDistanceControl()
 
 addSection("Combat")
@@ -1202,10 +1257,10 @@ addAuraRangeControl()
 addAttackDelayControl()
 
 addSection("Automation")
-addToggle("Auto loot nearby items", "autoLoot", "Scans GUID-named ITEM_CONTAINER Tools and presses F / Pick Up")
-addToggle("Return to bus when done", "autoReturnBus", "Teleports back after a loot sweep or inventory threshold")
+addToggle("Auto loot nearby items", "autoLoot", "Collects eligible loose items; ignores bus contents and vehicle parts")
+addToggle("Return to bus when done", "autoReturnBus", "Returns to a clear spot outside the bus collision area")
 addToggle("Auto-store at bus", "autoStoreAtBus", "Disabled until Last Stop StoreItem argument contract is verified")
-addToggle("Emergency return below 35% HP", "autoEmergencyReturn", "Requests a bus return when health falls below 35 percent")
+addToggle("Emergency return below 35% HP", "autoEmergencyReturn", "One-shot return; disables itself after reaching the safe bus perimeter")
 addSection("Loot priorities")
 addToggle("Money bags / cash", "autoCollectMoney")
 addToggle("Bonds", "autoCollectBonds")
@@ -1232,6 +1287,7 @@ local emergencyReturnButton = make("TextButton", {
 make("UICorner", {CornerRadius = UDim.new(0, 7)}, emergencyReturnButton)
 track(emergencyReturnButton.MouseButton1Click:Connect(function()
     state.manualReturnRequested = true
+    state.manualReturnReason = "manual"
     lootStatus = "Emergency return requested"
 end))
 end
@@ -1597,6 +1653,7 @@ state.cleanDisplayValue = function(value)
         pricetag=true, frame=true, label=true, canvasgroup=true,
         main=true, primary=true, primaryweld=true, weld=true,
         weldconstraint=true, motor6d=true, tps=true, fps=true,
+        ["entity name"]=true, ["unidentified loot"]=true, ["unknown item"]=true,
         common=true, uncommon=true, rare=true, epic=true, legendary=true,
         mythic=true, shine=true, surfaceappearance=true, basemodel=true,
     }
@@ -1621,7 +1678,7 @@ state.getItemDisplayName = function(object)
         if cleaned then return cleaned end
     end
 
-    local preferredAttributes = {"DisplayName", "ItemName", "WeaponName", "ItemType", "ToolType", "Type", "DisplayText", "Title", "Name"}
+    local preferredAttributes = {"DisplayName", "ItemName", "WeaponName", "ItemType", "ToolType", "Feature_Type", "Class", "Type", "DisplayText", "Title", "Name"}
     for _, attributeName in ipairs(preferredAttributes) do
         local ok, value = pcall(function() return object:GetAttribute(attributeName) end)
         local cleaned = ok and clean(value) or nil
@@ -3946,8 +4003,58 @@ state.hasLootWord = function(text, words)
     return false
 end
 
+state.isInsideLastStopBus = function(instance)
+    if not instance then return false end
+
+    local itemContainer = state.getItemContainerFolder and state.getItemContainerFolder() or nil
+    local busModel = itemContainer and itemContainer:FindFirstChild("Bus") or nil
+    if busModel then
+        local ok, inside = pcall(function()
+            return instance == busModel or instance:IsDescendantOf(busModel)
+        end)
+        if ok and inside then return true end
+    end
+
+    local current = instance
+    for _ = 1, 32 do
+        if not current or current == Workspace then break end
+        local featureBus, guid = nil, nil
+        pcall(function() featureBus = current:GetAttribute("Feature_Bus") end)
+        pcall(function() guid = current:GetAttribute("GUID") end)
+        if featureBus == true or (guid ~= nil and string.lower(tostring(guid)) == "bus") then
+            return true
+        end
+        if string.lower(current.Name) == "bus" and (current:IsA("Model") or current:IsA("Folder")) then
+            return true
+        end
+        current = current.Parent
+    end
+    return false
+end
+
+state.hasExcludedLastStopItemFeatures = function(candidate)
+    if not candidate then return true end
+    local featureType, className = nil, nil
+    local featureBus, featurePlanter, featureFurnace, featureGrill, featurePlace = false, false, false, false, false
+    pcall(function() featureType = candidate:GetAttribute("Feature_Type") end)
+    pcall(function() className = candidate:GetAttribute("Class") end)
+    pcall(function() featureBus = candidate:GetAttribute("Feature_Bus") == true end)
+    pcall(function() featurePlanter = candidate:GetAttribute("Feature_Planter") == true end)
+    pcall(function() featureFurnace = candidate:GetAttribute("Feature_Furnace") == true end)
+    pcall(function() featureGrill = candidate:GetAttribute("Feature_Grill") == true end)
+    pcall(function() featurePlace = candidate:GetAttribute("Feature_Place") == true end)
+
+    local typeText = string.lower(tostring(featureType or ""))
+    local classText = string.lower(tostring(className or ""))
+    return featureBus or typeText == "wheel" or typeText == "vehicle"
+        or classText == "basicwheel" or featurePlanter or featureFurnace or featureGrill or featurePlace
+end
+
 state.isExcludedLootCandidate = function(candidate, promptObjectText)
     if not candidate then
+        return true
+    end
+    if state.isInsideLastStopBus(candidate) or state.hasExcludedLastStopItemFeatures(candidate) then
         return true
     end
 
@@ -3984,12 +4091,12 @@ state.isExcludedLootCandidate = function(candidate, promptObjectText)
     end
 
     local ancestor = candidate.Parent
-    for _ = 1, 7 do
+    for _ = 1, 32 do
         if not ancestor or ancestor == Workspace then
             break
         end
-        if hasAny(string.lower(ancestor.Name), {"bus", "vehicle", "truck", "garage", "chassis"})
-            or state.hasLootWord(ancestor.Name, state.lootVehicleAncestorWords) then
+        if string.lower(ancestor.Name) == "bus"
+            or hasAny(string.lower(ancestor.Name), {"vehicle", "truck", "garage", "chassis"}) then
             return true
         end
         ancestor = ancestor.Parent
@@ -4219,9 +4326,11 @@ local function getLootCandidate(instance)
     -- Feature_Grab=true. Prefer that explicit game attribute over GUID/name
     -- heuristics; it is the strongest available pickup eligibility signal.
     if isLastStopItem then
-        if featureGrab then return candidate end
-        if candidate:IsA("Tool") then return nil end
-        return candidate
+        if featureGrab and not state.isInsideLastStopBus(candidate)
+            and not state.hasExcludedLastStopItemFeatures(candidate) then
+            return candidate
+        end
+        return nil
     end
     if classifyAura(candidate) then return nil end
 
@@ -4505,12 +4614,82 @@ local function findNearestBus(origin)
 end
 
 local function getBusReturnPosition(bus, busRoot, seat)
-    local anchor = seat or busRoot or getRootPart(bus)
-    if not anchor then
-        return nil
+    local character = LocalPlayer.Character
+    local characterRoot = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    if bus and bus:IsA("Model") then
+        local ok, boxCFrame, boxSize = pcall(function() return bus:GetBoundingBox() end)
+        if ok and typeof(boxCFrame) == "CFrame" and typeof(boxSize) == "Vector3" then
+            local right = boxCFrame.RightVector
+            local look = boxCFrame.LookVector
+            local sideX = boxSize.X * 0.5 + 10
+            local sideZ = boxSize.Z * 0.5 + 10
+            local offsets = {right * sideX, -right * sideX, look * sideZ, -look * sideZ}
+            if characterRoot then
+                table.sort(offsets, function(a, b)
+                    local pa = boxCFrame.Position + a
+                    local pb = boxCFrame.Position + b
+                    return (pa - characterRoot.Position).Magnitude < (pb - characterRoot.Position).Magnitude
+                end)
+            end
+
+            local rayParams = RaycastParams.new()
+            rayParams.FilterType = Enum.RaycastFilterType.Exclude
+            rayParams.FilterDescendantsInstances = {bus, character}
+            local overlapParams = OverlapParams.new()
+            overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+            overlapParams.FilterDescendantsInstances = {bus, character}
+
+            local rootHalfHeight = characterRoot and characterRoot.Size.Y * 0.5 or 1
+            local hipHeight = humanoid and humanoid.HipHeight or 2
+            for _, offset in ipairs(offsets) do
+                local horizontal = boxCFrame.Position + offset
+                local rayOrigin = Vector3.new(horizontal.X, boxCFrame.Position.Y + boxSize.Y * 0.5 + 35, horizontal.Z)
+                local hit = Workspace:Raycast(rayOrigin, Vector3.new(0, -300, 0), rayParams)
+                local groundY = hit and hit.Position.Y or (boxCFrame.Position.Y - boxSize.Y * 0.5)
+                local destination = Vector3.new(horizontal.X, groundY + hipHeight + rootHalfHeight + 0.15, horizontal.Z)
+                local blockers = Workspace:GetPartBoundsInBox(CFrame.new(destination), Vector3.new(2.8, 4.5, 2.8), overlapParams)
+                local blocked = false
+                for _, part in ipairs(blockers) do
+                    if part.CanCollide and part.Transparency < 0.98 then
+                        blocked = true
+                        break
+                    end
+                end
+                if not blocked then return destination end
+            end
+
+            local horizontal = boxCFrame.Position + right * (boxSize.X * 0.5 + 14)
+            local groundY = boxCFrame.Position.Y - boxSize.Y * 0.5
+            return Vector3.new(horizontal.X, groundY + hipHeight + rootHalfHeight + 0.15, horizontal.Z)
+        end
     end
-    -- Stop beside the bus instead of trying to path into its collision geometry.
-    return anchor.Position + anchor.CFrame.RightVector * 6 + Vector3.new(0, 1.5, 0)
+
+    local anchor = busRoot or seat or getRootPart(bus)
+    if not anchor then return nil end
+    return anchor.Position + anchor.CFrame.RightVector * 16 + Vector3.new(0, 3.2, 0)
+end
+
+state.isAtBusArea = function(root, bus, busRoot, seat)
+    if not root or not root.Parent then return false end
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if seat and humanoid then
+        local ok, occupant = pcall(function() return seat.Occupant end)
+        if ok and occupant == humanoid then return true end
+    end
+    if bus and bus:IsA("Model") then
+        local ok, boxCFrame, boxSize = pcall(function() return bus:GetBoundingBox() end)
+        if ok then
+            local localPosition = boxCFrame:PointToObjectSpace(root.Position)
+            return math.abs(localPosition.X) <= boxSize.X * 0.5 + 15
+                and math.abs(localPosition.Z) <= boxSize.Z * 0.5 + 15
+                and localPosition.Y >= -boxSize.Y * 0.5 - 10
+                and localPosition.Y <= boxSize.Y * 0.5 + 22
+        end
+    end
+    return busRoot ~= nil and (root.Position - busRoot.Position).Magnitude <= 22
 end
 
 local function teleportRootTo(root, destination, lookAtPosition)
@@ -5078,15 +5257,16 @@ local function buildRuntimeDiagnostics()
         end
     end
 
-    add("LAST STOP TOOLKIT DIAGNOSTICS / V10.5")
+    add("LAST STOP TOOLKIT DIAGNOSTICS / V10.6")
     add("PlaceId=" .. tostring(game.PlaceId) .. " GameId=" .. tostring(game.GameId))
     add("Last Stop universe match=" .. tostring(game.GameId == 10759337137))
     add("JobId=" .. tostring(game.JobId))
     add("Melee state=" .. tostring(state.killAura) .. " API=" .. tostring(state.currentAuraApi))
     add("Loot state=" .. tostring(state.autoLoot) .. " API=" .. tostring(state.currentLootApi))
-    add(string.format("Loot scan: direct=%d Feature_Grab=%d registered=%d inRange=%d",
+    add(string.format("Loot scan: direct=%d Feature_Grab=%d registered=%d inRange=%d busExcluded=%d featureExcluded=%d",
         state.lastLootDirectCount, state.lastLootFeatureGrabCount,
-        state.lastLootRegisteredCount, state.lastLootInRangeCount))
+        state.lastLootRegisteredCount, state.lastLootInRangeCount,
+        state.lastLootBusExcludedCount, state.lastLootFeatureExcludedCount))
     add("Last OnCollected=" .. tostring(state.lastCollectedMethodName)
         .. " age=" .. string.format("%.2f", math.max(0, os.clock() - state.lastCollectedMethodAt)))
     add("Last EntityKilled=" .. tostring(state.lastEntityKilledType)
@@ -5094,6 +5274,8 @@ local function buildRuntimeDiagnostics()
     add("Last Damage position=" .. tostring(state.lastDamagePosition)
         .. " age=" .. string.format("%.2f", math.max(0, os.clock() - state.lastDamageEventAt)))
     add("Gun aim=" .. tostring(state.gunAimAssist) .. " shoot=" .. tostring(state.gunAutoShoot))
+    add("Fullbright=" .. tostring(state.fullbright) .. " | EmergencyReturn=" .. tostring(state.autoEmergencyReturn)
+        .. " | EmergencyLatched=" .. tostring(state.emergencyReturnLatched) .. " | LootRange=" .. tostring(state.lootRange))
 
     local character = LocalPlayer.Character
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
@@ -5245,13 +5427,21 @@ state.refreshLastStopLootCandidates = function()
         state.lastLootDirectCount = 0
         state.lastLootFeatureGrabCount = 0
         state.lastLootRegisteredCount = 0
+        state.lastLootBusExcludedCount = 0
+        state.lastLootFeatureExcludedCount = 0
         return 0
     end
 
     local directCount, featureGrabCount, registeredCount = 0, 0, 0
+    local busExcludedCount, featureExcludedCount = 0, 0
     for _, child in ipairs(container:GetChildren()) do
         if child:IsA("Tool") or child:IsA("Model") or child:IsA("BasePart") then
             directCount = directCount + 1
+            if state.isInsideLastStopBus(child) then
+                busExcludedCount = busExcludedCount + 1
+            elseif state.hasExcludedLastStopItemFeatures(child) then
+                featureExcludedCount = featureExcludedCount + 1
+            end
             local featureGrab = false
             pcall(function() featureGrab = child:GetAttribute("Feature_Grab") == true end)
             if featureGrab then featureGrabCount = featureGrabCount + 1 end
@@ -5277,6 +5467,8 @@ state.refreshLastStopLootCandidates = function()
     state.lastLootDirectCount = directCount
     state.lastLootFeatureGrabCount = featureGrabCount
     state.lastLootRegisteredCount = registeredCount
+    state.lastLootBusExcludedCount = busExcludedCount
+    state.lastLootFeatureExcludedCount = featureExcludedCount
     return registeredCount
 end
 
@@ -5289,14 +5481,34 @@ local function runAutoLoot()
             if state.autoEmergencyReturn and not state.manualReturnRequested then
                 local character = LocalPlayer.Character
                 local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-                if humanoid and humanoid.MaxHealth > 0
-                    and humanoid.Health / humanoid.MaxHealth <= 0.35 then
-                    state.manualReturnRequested = true
-                    lootStatus = "Emergency return triggered by low health"
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                if humanoid and root and humanoid.MaxHealth > 0 then
+                    local healthRatio = humanoid.Health / humanoid.MaxHealth
+                    if healthRatio > 0.45 then
+                        state.emergencyReturnLatched = false
+                    elseif healthRatio <= 0.35 then
+                        local bus, busRoot, seat = findNearestBus(root.Position)
+                        if bus and state.isAtBusArea(root, bus, busRoot, seat) then
+                            state.autoEmergencyReturn = false
+                            state.emergencyReturnLatched = false
+                            local refresh = toggleRefreshers.autoEmergencyReturn
+                            if refresh then refresh() end
+                            lootStatus = "Emergency return auto-disabled: already at bus"
+                        elseif not state.emergencyReturnLatched
+                            and os.clock() - (state.lastEmergencyReturnAt or 0) >= 8 then
+                            state.emergencyReturnLatched = true
+                            state.lastEmergencyReturnAt = os.clock()
+                            state.manualReturnRequested = true
+                            state.manualReturnReason = "emergency"
+                            lootStatus = "Emergency return triggered by low health"
+                        end
+                    end
                 end
             end
             if state.manualReturnRequested then
                 state.manualReturnRequested = false
+                local returnReason = state.manualReturnReason or "manual"
+                state.manualReturnReason = nil
                 local character = LocalPlayer.Character
                 local root = character and character:FindFirstChild("HumanoidRootPart")
                 if root then
@@ -5304,18 +5516,41 @@ local function runAutoLoot()
                     local destination = bus and getBusReturnPosition(bus, busRoot, seat) or nil
                     if bus and destination then
                         lootCurrentTarget = bus.Name
-                        local returned = teleportRootTo(root, destination, busRoot.Position)
-                        lootStatus = returned and "Emergency returned to bus" or "Emergency bus teleport rejected"
+                        local alreadyThere = state.isAtBusArea(root, bus, busRoot, seat)
+                        local returned = alreadyThere or teleportRootTo(root, destination, busRoot.Position)
                         if returned then
-                            lootTeleports = lootTeleports + 1
+                            if not alreadyThere then lootTeleports = lootTeleports + 1 end
+                            lootStatus = returnReason == "emergency"
+                                and "Emergency return complete; auto-return disabled"
+                                or "Returned to safe bus perimeter"
+                            if returnReason == "emergency" then
+                                state.autoEmergencyReturn = false
+                                state.emergencyReturnLatched = false
+                                local refresh = toggleRefreshers.autoEmergencyReturn
+                                if refresh then refresh() end
+                            end
+                        else
+                            lootStatus = "Bus return failed; retry will be delayed"
+                            if returnReason == "emergency" then
+                                state.emergencyReturnLatched = false
+                                state.lastEmergencyReturnAt = os.clock()
+                            end
                         end
                     else
                         lootCurrentTarget = "--"
                         lootStatus = "Emergency return: bus not detected"
+                        if returnReason == "emergency" then
+                            state.emergencyReturnLatched = false
+                            state.lastEmergencyReturnAt = os.clock()
+                        end
                     end
                 else
                     lootCurrentTarget = "--"
                     lootStatus = "Emergency return: character unavailable"
+                    if returnReason == "emergency" then
+                        state.emergencyReturnLatched = false
+                        state.lastEmergencyReturnAt = os.clock()
+                    end
                 end
                 task.wait(0.5)
                 return
