@@ -1,5 +1,5 @@
 --[[
-    LAST STOP [BETA] - ROADSIDE TOOLKIT v10.2
+    LAST STOP [BETA] - ROADSIDE TOOLKIT v10.3
     Client-side survival toolkit.
 
     Included:
@@ -16,11 +16,10 @@
       * RightShift toggles the menu
 
     The aura excludes player characters and known friendly NPCs. It supports
-    EntityName/Bounty NPC markers, recognizes Last Stop's visible Swing prompt,
-    and prefers a detected native melee request without moving the character.
-    Melee uses feature-detected Dead Rails-style SwingMelee / Tool.SwingEvent remotes.
-    Gun and loot adapters use only exact Dead Rails-style remote paths when present;
-    otherwise they fall back to visible input. Server-side validation still applies.
+    Uses Last Stop's observed ENTITY_CONTAINER / ITEM_CONTAINER hierarchy and
+    Knit service discovery. Dead Rails APIs are treated as optional references only;
+    no remote is invoked unless its exact protocol is independently verified.
+    Melee input and click-to-grab remain subject to the game's own hit validation.
 ]]
 
 local Players = game:GetService("Players")
@@ -66,8 +65,16 @@ local state = {
     deadRailsToolRemoteScanAt = {},
     cachedObjectModelsFolder = nil,
     cachedRuntimeItemsFolder = nil,
+    cachedItemContainer = nil,
     objectModelsScanAt = 0,
     runtimeItemsScanAt = 0,
+    itemContainerScanAt = 0,
+    lastDamageEventSummary = "No DamageDealt event observed yet",
+    lastProjectileEventSummary = "No ProjectileHit event observed yet",
+    entityContextCache = setmetatable({}, {__mode = "k"}),
+    entityContextCacheAt = setmetatable({}, {__mode = "k"}),
+    entityRigCache = setmetatable({}, {__mode = "k"}),
+    entityRigCacheAt = setmetatable({}, {__mode = "k"}),
     running = true,
     loot = true,
     zombies = true,
@@ -445,7 +452,7 @@ make("TextLabel", {
     Position = UDim2.new(0, 14, 0, 27),
     Size = UDim2.new(1, -105, 0, 13),
     BackgroundTransparency = 1,
-    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V10.2",
+    Text = "CLIENT-SIDE SURVIVAL TOOLKIT  /  V10.3",
     TextColor3 = palette.muted,
     Font = Enum.Font.Gotham,
     TextSize = 9,
@@ -1027,7 +1034,7 @@ local function addAttackDelayControl()
         Position = UDim2.new(0, 11, 0, 0),
         Size = UDim2.new(1, -145, 1, 0),
         BackgroundTransparency = 1,
-        Text = "Melee remote interval",
+        Text = "Melee input interval",
         TextColor3 = palette.text,
         Font = Enum.Font.GothamSemibold,
         TextSize = 11,
@@ -1167,24 +1174,23 @@ addToggle("Distance labels", "distance")
 addDistanceControl()
 
 addSection("Combat")
-addToggle("Zombie / enemy kill aura", "killAura", "Continuous native swing at 0.01s when supported; never chases")
+addToggle("Zombie / enemy kill aura", "killAura", "Targets live NPC rigs and sends normal Swing input; never chases")
 addToggle("Include bosses", "auraBosses", "Includes Fred, Anubis, Dracula, Crystalus and Juggernaut")
 addToggle("Target unknown NPCs", "auraAllNPCs", "Fallback detection; known friendly NPCs are excluded")
 addToggle("Auto-equip melee", "autoEquipMelee", "Equips an available melee tool when none is equipped")
-addToggle("Auto-face target", "auraFace", "Optional facing; native melee requests send target direction directly")
-addToggle("Aim camera at target", "auraAimCamera", "Optional camera movement; not required by native melee requests")
+addToggle("Auto-face target", "auraFace", "Rotates your character toward the target for normal melee input")
+addToggle("Aim camera at target", "auraAimCamera", "Optional camera aim for click-to-swing and gun input")
 addToggle("Gun auto-aim", "gunAimAssist", "Aims at the nearest visible hostile while a firearm is equipped")
 addToggle("Gun auto-shoot", "gunAutoShoot", "Fires only when a raycast confirms a clear line to the target")
-addToggle("Gun auto-reload", "gunAutoReload", "Uses the Dead Rails Reload remote only when an ammo counter reads zero")
-addToggle("Experimental weapon-reset melee", "rapidToolResetMelee", "Dead Rails DropTool -> PickUpTool -> SwingEvent adapter; may temporarily drop your weapon")
+addToggle("Gun auto-reload", "gunAutoReload", "Uses Last Stop's normal R reload control when an ammo counter reads zero")
 addGunRangeControl()
 addAuraRangeControl()
 addAttackDelayControl()
 
 addSection("Automation")
-addToggle("Auto loot nearby items", "autoLoot", "Safe-side teleports to valid pickups; ignores wheels, vehicles and buildings")
+addToggle("Auto loot nearby items", "autoLoot", "Scans Last Stop ITEM_CONTAINER and uses normal click-to-grab")
 addToggle("Return to bus when done", "autoReturnBus", "Teleports back after a loot sweep or inventory threshold")
-addToggle("Auto-store at bus", "autoStoreAtBus", "Uses RuntimeItems + Store only when that exact API is detected")
+addToggle("Auto-store at bus", "autoStoreAtBus", "Disabled until Last Stop StoreItem argument contract is verified")
 addToggle("Emergency return below 35% HP", "autoEmergencyReturn", "Requests a bus return when health falls below 35 percent")
 addSection("Loot priorities")
 addToggle("Money bags / cash", "autoCollectMoney")
@@ -1387,7 +1393,7 @@ local lootWords = {
     "coal", "pipe", "armor", "vest", "flashlight", "fuse", "engine", "canister"
 }
 
-local lootFolderWords = {"loot", "drops", "pickups", "worlditems", "items"}
+local lootFolderWords = {"loot", "drops", "pickups", "worlditems", "items", "item_container", "itemcontainer"}
 
 local function hasAny(text, words)
     for _, word in ipairs(words) do
@@ -1429,6 +1435,149 @@ local function getContextName(instance)
         parent = parent.Parent
     end
     return table.concat(names, " ")
+end
+
+-- Last Stop-specific containers. Unlike Dead Rails, this experience exposes
+-- ENTITY_CONTAINER and ITEM_CONTAINER in Workspace.
+state.getLastStopEntityContainer = function()
+    return Workspace:FindFirstChild("ENTITY_CONTAINER")
+end
+
+state.getLastStopEntityContext = function(model)
+    if model then
+        local cached = state.entityContextCache[model]
+        local cachedAt = state.entityContextCacheAt[model] or 0
+        if cached and os.clock() - cachedAt < 0.35 then
+            return cached
+        end
+    end
+    local names = {getContextName(model)}
+    if not model or not model:IsA("Model") then
+        return table.concat(names, " ")
+    end
+
+    local ok, descendants = pcall(function()
+        return model:GetDescendants()
+    end)
+    if ok then
+        local inspected = 0
+        for _, object in ipairs(descendants) do
+            local name = string.lower(object.Name)
+            if hasAny(name, zombieWords) or hasAny(name, bossWords)
+                or hasAny(name, friendlyWords)
+                or hasAny(name, {"corpse", "ragdoll", "deadbody", "dead_body", "death"}) then
+                table.insert(names, name)
+                inspected = inspected + 1
+                if inspected >= 48 then break end
+            end
+
+            for _, attributeName in ipairs({"EntityName", "DisplayName", "NPCName"}) do
+                local attrOk, value = pcall(function()
+                    return object:GetAttribute(attributeName)
+                end)
+                if attrOk and type(value) == "string" and value ~= "" then
+                    local lowered = string.lower(value)
+                    if hasAny(lowered, zombieWords) or hasAny(lowered, bossWords)
+                        or hasAny(lowered, friendlyWords) then
+                        table.insert(names, lowered)
+                    end
+                end
+            end
+        end
+    end
+    local result = table.concat(names, " ")
+    if model then
+        state.entityContextCache[model] = result
+        state.entityContextCacheAt[model] = os.clock()
+    end
+    return result
+end
+
+state.getLastStopEntityRoot = function(instance)
+    local entityContainer = state.getLastStopEntityContainer()
+    local current = instance
+    local highestModel = nil
+
+    while current and current ~= Workspace do
+        if current:IsA("Model") then
+            highestModel = current
+            if entityContainer and current.Parent == entityContainer then
+                return current
+            end
+        end
+        current = current.Parent
+    end
+
+    if highestModel then
+        local context = state.getLastStopEntityContext(highestModel)
+        if hasAny(context, zombieWords) or hasAny(context, bossWords) then
+            return highestModel
+        end
+    end
+    return nil
+end
+
+state.isLastStopEntityRoot = function(model)
+    if not model or not model:IsA("Model") then
+        return false
+    end
+    local entityContainer = state.getLastStopEntityContainer()
+    if entityContainer and model.Parent == entityContainer then
+        return true
+    end
+    local context = state.getLastStopEntityContext(model)
+    return hasAny(context, zombieWords) or hasAny(context, bossWords)
+end
+
+state.getEntityRigEvidence = function(model)
+    if model then
+        local cached = state.entityRigCache[model]
+        local cachedAt = state.entityRigCacheAt[model] or 0
+        if cached and os.clock() - cachedAt < 0.15 then
+            return cached[1], cached[2], cached[3], cached[4]
+        end
+    end
+    local motorCount, ballSocketCount, animatorCount, playingTrackCount = 0, 0, 0, 0
+    if not model then
+        return motorCount, ballSocketCount, animatorCount, playingTrackCount
+    end
+    for _, object in ipairs(model:GetDescendants()) do
+        if object:IsA("Motor6D") then
+            motorCount = motorCount + 1
+        elseif object:IsA("BallSocketConstraint") then
+            ballSocketCount = ballSocketCount + 1
+        elseif object:IsA("Animator") then
+            animatorCount = animatorCount + 1
+            local ok, tracks = pcall(function()
+                return object:GetPlayingAnimationTracks()
+            end)
+            if ok and type(tracks) == "table" then
+                playingTrackCount = playingTrackCount + #tracks
+            end
+        end
+    end
+    if model then
+        state.entityRigCache[model] = {motorCount, ballSocketCount, animatorCount, playingTrackCount}
+        state.entityRigCacheAt[model] = os.clock()
+    end
+    return motorCount, ballSocketCount, animatorCount, playingTrackCount
+end
+
+state.getItemIdentityText = function(object)
+    if not object then return "" end
+    local values = {string.lower(object.Name)}
+    for _, attributeName in ipairs({"ItemName", "DisplayName", "WeaponName", "ItemType", "WeaponType", "ToolType", "Type"}) do
+        local ok, value = pcall(function() return object:GetAttribute(attributeName) end)
+        if ok and type(value) == "string" and value ~= "" then
+            table.insert(values, string.lower(value))
+        end
+    end
+    for _, child in ipairs(object:GetChildren()) do
+        if child:IsA("StringValue") and hasAny(string.lower(child.Name), {"name", "type", "item", "weapon"}) then
+            table.insert(values, string.lower(child.Value))
+        end
+    end
+    return table.concat(values, " ")
 end
 
 local function classify(instance)
@@ -1483,7 +1632,8 @@ local function classify(instance)
 end
 
 local function classifyAura(instance)
-    local context = getContextName(instance)
+    local context = instance and instance:IsA("Model")
+        and state.getLastStopEntityContext(instance) or getContextName(instance)
     if hasAny(context, friendlyWords) then
         return nil
     end
@@ -1610,7 +1760,7 @@ local function isMeleeTool(tool)
         return false
     end
 
-    local toolName = string.lower(tool.Name)
+    local toolName = state.getItemIdentityText(tool)
     local ok, isMelee = pcall(function()
         return tool:GetAttribute("IsMelee")
     end)
@@ -1659,7 +1809,7 @@ local function getMeleeToolScore(tool)
         or readToolNumber(tool, "BaseDamage")
         or readToolNumber(tool, "Power")
 
-    local name = string.lower(tool.Name)
+    local name = state.getItemIdentityText(tool)
     local nameScore = 1
     local priorities = {
         {"chainsaw", 12}, {"katana", 11}, {"sword", 10}, {"axe", 9},
@@ -1708,7 +1858,7 @@ local function findMeleeVisual(character)
 
     for _, object in ipairs(character:GetDescendants()) do
         if object:IsA("Model") or object:IsA("BasePart") then
-            local name = string.lower(object.Name)
+            local name = state.getItemIdentityText(object)
             if hasAny(name, meleeWords) and not object:FindFirstAncestorOfClass("Tool") then
                 return object
             end
@@ -1790,7 +1940,24 @@ local function getMeleeReady(character)
     -- can be represented by the game's own hotbar system rather than a Tool.
     local hasPrompt, uiWeaponName = getSwingPromptInfo()
     if hasPrompt then
-        return true, (uiWeaponName or "Melee") .. " (Swing prompt)", nil
+        -- Last Stop's hotbar can equip a GUID-named Tool with no Dead Rails
+        -- MeleeWeaponConfiguration/SwingEvent descendants. If exactly one Tool
+        -- is equipped, retain it for Tool:Activate/input fallback instead of nil.
+        local onlyEquippedTool = nil
+        local equippedToolCount = 0
+        if character then
+            for _, child in ipairs(character:GetChildren()) do
+                if child:IsA("Tool") then
+                    equippedToolCount = equippedToolCount + 1
+                    onlyEquippedTool = child
+                end
+            end
+        end
+        if equippedToolCount ~= 1 then
+            onlyEquippedTool = nil
+        end
+        local displayName = uiWeaponName or (onlyEquippedTool and onlyEquippedTool.Name) or "Melee"
+        return true, displayName .. " (Swing prompt)", onlyEquippedTool
     end
 
     return false, "No melee / Swing prompt detected", nil
@@ -1885,6 +2052,9 @@ end
 -- Resolve only existing RemoteEvents; never invent or invoke unrelated remotes.
 
 state.getGlobalSwingRemote = function()
+    if game.GameId == 10759337137 then
+        return nil, nil
+    end
     if state.cachedGlobalSwingRemote and state.cachedGlobalSwingRemote.Parent then
         return state.cachedGlobalSwingRemote, state.cachedGlobalSwingPath
     end
@@ -1945,13 +2115,17 @@ state.resolveMeleeRemote = function(tool)
 end
 
 state.sendNativeMelee = function(tool, targetRoot, characterRoot)
-    if not tool or not characterRoot then
-        return false, "Missing equipped melee Tool / character root"
+    if not characterRoot then
+        return false, "Missing character root"
+    end
+    if not tool then
+        return false, "Last Stop Swing input only; no Tool object for remote adapter"
     end
 
     local remote, apiName, apiKind = state.resolveMeleeRemote(tool)
     if not remote then
-        state.currentAuraApi = "Not found"
+        state.currentAuraApi = game.GameId == 10759337137
+            and "Last Stop: no public swing remote; input only" or "No compatible swing remote"
         return false, apiName
     end
 
@@ -2166,8 +2340,8 @@ local function isTargetDead(model)
         return true
     end
 
-    local context = getContextName(model)
-    if hasAny(context, {"corpse", "ragdoll", "dead body", "deadbody", "zombie corpse", "dead npc"}) then
+    local context = state.getLastStopEntityContext(model)
+    if hasAny(context, {"corpse", "ragdoll", "dead body", "deadbody", "zombie corpse", "dead npc", "deathstate"}) then
         state.markAuraDead(model)
         return true
     end
@@ -2243,6 +2417,14 @@ local function isTargetDead(model)
         state.markAuraDead(model)
         return true
     end
+
+    if state.isLastStopEntityRoot(model) then
+        local motors, ballSockets = state.getEntityRigEvidence(model)
+        if motors == 0 and ballSockets >= 3 then
+            state.markAuraDead(model)
+            return true
+        end
+    end
     return false
 end
 
@@ -2264,6 +2446,23 @@ state.hasTargetAliveSignal = function(model)
     for _, valueName in ipairs({"Alive", "IsAlive"}) do
         local valueObject = model:FindFirstChild(valueName, true)
         if valueObject and valueObject:IsA("BoolValue") and valueObject.Value then
+            return true
+        end
+    end
+
+    -- Last Stop's custom NPCs are rooted in ENTITY_CONTAINER and often have
+    -- no Humanoid/Health object. Treat a non-ragdolled entity rig as observable.
+    if state.isLastStopEntityRoot(model) then
+        local motors, ballSockets, animators, playingTracks = state.getEntityRigEvidence(model)
+        if motors >= 2 or playingTracks > 0 then
+            return true
+        end
+        if motors == 0 and ballSockets >= 3 then
+            state.markAuraDead(model)
+            return false
+        end
+        local entityContainer = state.getLastStopEntityContainer()
+        if entityContainer and model.Parent == entityContainer then
             return true
         end
     end
@@ -2331,10 +2530,21 @@ state.bindAuraDeathSignals = function(model)
     for _, object in ipairs(model:GetDescendants()) do
         watchObject(object)
     end
-    add(model.DescendantAdded:Connect(watchObject))
+    add(model.DescendantAdded:Connect(function(object)
+        state.entityContextCache[model] = nil
+        state.entityRigCache[model] = nil
+        watchObject(object)
+        if object:IsA("BallSocketConstraint") then
+            task.defer(checkDeath)
+        end
+    end))
     add(model.DescendantRemoving:Connect(function(object)
+        state.entityContextCache[model] = nil
+        state.entityRigCache[model] = nil
         if object:IsA("Humanoid") and object.Health <= 0 then
             state.markAuraDead(model)
+        elseif object:IsA("Motor6D") or object:IsA("Animator") then
+            task.defer(checkDeath)
         end
     end))
 
@@ -2342,39 +2552,48 @@ state.bindAuraDeathSignals = function(model)
 end
 
 local function findAuraModel(instance)
+    -- Prefer the complete model directly parented to Last Stop's entity container.
+    -- This prevents a body part such as Dress.GuardPolice.Torso becoming a target.
+    local lastStopRoot = state.getLastStopEntityRoot(instance)
+    if lastStopRoot then
+        return lastStopRoot
+    end
+
     local current = instance
     local hostilePart = nil
     local classifiedModel = nil
     local healthModel = nil
+    local highestModel = nil
 
-    -- Walk outward instead of returning the first nested model. Some NPC rigs
-    -- have inner body-part models while their Humanoid/health controller lives
-    -- on the parent model; choosing the inner model hides the death signal.
     while current and current ~= Workspace do
         if current:IsA("Model") and getRootPart(current) then
-            local context = getContextName(current)
+            highestModel = current
+            local context = state.getLastStopEntityContext(current)
             if not hasAny(context, friendlyWords) then
                 local hasHumanoid = current:FindFirstChildWhichIsA("Humanoid", true) ~= nil
                 local hasHealth = getTargetHealth(current) ~= nil
-                local isNpcContainer = hasAny(context, npcContainerWords)
                 local kind = classifyAura(current)
-
                 if (hasHumanoid or hasHealth) and not healthModel then
                     healthModel = current
-                elseif (kind or isNpcContainer) and not classifiedModel then
+                elseif kind and not classifiedModel then
                     classifiedModel = current
                 end
             end
         elseif current:IsA("BasePart") then
             local context = getContextName(current)
-            if hasAny(context, zombieWords) or hasAny(context, bossWords)
-                or hasAny(context, npcContainerWords) then
+            if hasAny(context, zombieWords) or hasAny(context, bossWords) then
                 hostilePart = current
             end
         end
         current = current.Parent
     end
 
+    if highestModel then
+        local context = state.getLastStopEntityContext(highestModel)
+        if hasAny(context, zombieWords) or hasAny(context, bossWords) then
+            return highestModel
+        end
+    end
     return healthModel or classifiedModel or hostilePart
 end
 
@@ -2390,7 +2609,7 @@ local function registerAuraCandidate(instance)
         return
     end
 
-    local context = getContextName(model)
+    local context = state.getLastStopEntityContext(model)
     if hasAny(context, friendlyWords) then
         auraCandidates[model] = nil
         return
@@ -2404,7 +2623,7 @@ local function registerAuraCandidate(instance)
 
     local hasHumanoid = model:FindFirstChildWhichIsA("Humanoid", true) ~= nil
     local hasHealth = getTargetHealth(model) ~= nil
-    local isNpcContainer = hasAny(context, npcContainerWords)
+    local isNpcContainer = hasAny(context, npcContainerWords) or state.isLastStopEntityRoot(model)
     if hasHumanoid or hasHealth or isNpcContainer then
         auraCandidates[model] = "unknown"
     else
@@ -2443,7 +2662,7 @@ local function getNearestAuraTarget(characterRoot)
             auraCandidates[model] = nil
         else
             local root = getRootPart(model)
-            local context = getContextName(model)
+            local context = state.getLastStopEntityContext(model)
 
             if not root or isPlayerCharacter(model) or isTargetDead(model)
                 or hasAny(context, friendlyWords) then
@@ -2682,6 +2901,9 @@ end))
 
 state.deadRailsToolRemoteCache = state.deadRailsToolRemoteCache or {}
 state.getDeadRailsToolRemote = function(remoteName)
+    if game.GameId == 10759337137 then
+        return nil
+    end
     local cached = state.deadRailsToolRemoteCache[remoteName]
     if cached and cached.Parent then return cached end
 
@@ -2715,6 +2937,7 @@ state.getDeadRailsToolRemote = function(remoteName)
 end
 
 state.getDirectRuntimeItemsFolder = function()
+    if game.GameId == 10759337137 then return nil end
     local direct = Workspace:FindFirstChild("RuntimeItems")
     if direct and (direct:IsA("Folder") or direct:IsA("Model")) then
         return direct
@@ -2929,7 +3152,9 @@ local function runKillAura()
             local rapidAdapterAvailable = state.rapidToolResetAvailable(meleeTool)
             state.currentAuraApi = nativeMeleeAvailable and meleeApiName
                 or (rapidAdapterAvailable and "DropTool/PickUpTool + SwingEvent available")
-                or (meleeTool and "No compatible native remote; input fallback" or "No Tool object; input fallback")
+                or (game.GameId == 10759337137
+                    and "Last Stop: normal Swing input; no verified melee remote"
+                    or (meleeTool and "No compatible native remote; input fallback" or "No Tool object; input fallback"))
             if not target or not targetRoot then
                 combatTargetActive = false
                 releaseAuraInput()
@@ -3101,7 +3326,7 @@ local function isGunTool(tool)
         return true
     end
 
-    local name = string.lower(tool.Name)
+    local name = state.getItemIdentityText(tool)
     if hasAny(name, gunNameWords) then
         return true
     end
@@ -3123,9 +3348,39 @@ local function getEquippedGun(character)
     -- instead of parenting a Roblox Tool directly to the character.
     for _, object in ipairs(character:GetDescendants()) do
         if (object:IsA("Model") or object:IsA("BasePart"))
-            and hasAny(string.lower(object.Name), gunNameWords)
+            and hasAny(state.getItemIdentityText(object), gunNameWords)
             and not object:FindFirstAncestorOfClass("Tool") then
             return object
+        end
+    end
+
+    -- Last Stop can expose the selected item through its HUD rather than a
+    -- descriptive Tool.Name. If a Shoot prompt is visible and exactly one Tool
+    -- is equipped, use that Tool for ordinary input-based aiming/shooting.
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local shootPromptVisible = false
+    if playerGui then
+        for _, object in ipairs(playerGui:GetDescendants()) do
+            if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+                local ok, text = pcall(function() return object.Text end)
+                if ok and type(text) == "string" and string.find(string.lower(text), "shoot", 1, true) then
+                    shootPromptVisible = true
+                    break
+                end
+            end
+        end
+    end
+    if shootPromptVisible then
+        local onlyTool = nil
+        local toolCount = 0
+        for _, child in ipairs(character:GetChildren()) do
+            if child:IsA("Tool") then
+                toolCount = toolCount + 1
+                onlyTool = child
+            end
+        end
+        if toolCount == 1 then
+            return onlyTool
         end
     end
     return nil
@@ -3252,6 +3507,9 @@ local function aimGunAt(targetPart)
 end
 
 state.getDeadRailsShootRemote = function()
+    if game.GameId == 10759337137 then
+        return nil
+    end
     if state.cachedDeadRailsShootRemote and state.cachedDeadRailsShootRemote.Parent then
         return state.cachedDeadRailsShootRemote
     end
@@ -3355,38 +3613,30 @@ local function getGunAmmoCount(gun)
     return nil
 end
 
-local function tryDeadRailsAutoReload(gun)
+state.tryLastStopAutoReload = function(gun)
     if not state.gunAutoReload or not gun then return false end
     local ammo = getGunAmmoCount(gun)
     if ammo == nil or ammo > 0 or os.clock() - state.lastGunReloadAt < 1.5 then
         return false
     end
 
-    local cached = state.cachedDeadRailsReloadRemote
-    if not (cached and cached.Parent) then
-        local remotes = state.replicatedStorage:FindFirstChild("Remotes")
-        local weapon = remotes and remotes:FindFirstChild("Weapon")
-        local candidate = weapon and weapon:FindFirstChild("Reload")
-        if candidate and candidate:IsA("RemoteEvent") then
-            state.cachedDeadRailsReloadRemote = candidate
-            cached = candidate
-        end
-    end
-    if not cached then
-        state.currentGunApi = "Reload remote not found"
+    if not virtualInput then
+        state.currentGunApi = "R reload input unavailable"
         return false
     end
 
     local ok = pcall(function()
-        cached:FireServer(Workspace:GetServerTimeNow(), gun)
+        virtualInput:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+        task.wait(0.04)
+        virtualInput:SendKeyEvent(false, Enum.KeyCode.R, false, game)
     end)
     if ok then
         state.lastGunReloadAt = os.clock()
-        state.currentGunApi = "Remotes.Weapon.Reload"
-        gunStatus = "Reload request sent"
+        state.currentGunApi = "Last Stop R reload input"
+        gunStatus = "Reload key sent"
         return true
     end
-    state.currentGunApi = "Reload request failed"
+    state.currentGunApi = "R reload input failed"
     return false
 end
 
@@ -3423,7 +3673,7 @@ local function runGunAssist()
                 return
             end
 
-            if state.gunAutoReload and tryDeadRailsAutoReload(gun) then
+            if state.gunAutoReload and state.tryLastStopAutoReload(gun) then
                 return
             end
 
@@ -3550,6 +3800,27 @@ state.isExcludedLootCandidate = function(candidate, promptObjectText)
         return true
     end
 
+    -- Some Last Stop world items are GUID-named. Inspect their child names too,
+    -- so a GUID-named wheel/tire cannot bypass the explicit vehicle exclusions.
+    if candidate:IsA("Model") then
+        local inspected = 0
+        for _, descendant in ipairs(candidate:GetDescendants()) do
+            local childName = string.lower(descendant.Name)
+            if hasAny(childName, {"wheel", "tire", "tyre", "rim", "hubcap", "bus", "vehicle", "truck", "chassis", "building", "garage"}) then
+                return true
+            end
+            inspected = inspected + 1
+            if inspected >= 180 then break end
+        end
+        local boundsOk, _, boundsSize = pcall(function()
+            return candidate:GetBoundingBox()
+        end)
+        if boundsOk and typeof(boundsSize) == "Vector3"
+            and (boundsSize.X > 36 or boundsSize.Y > 36 or boundsSize.Z > 36) then
+            return true
+        end
+    end
+
     local ancestor = candidate.Parent
     for _ = 1, 7 do
         if not ancestor or ancestor == Workspace then
@@ -3573,7 +3844,7 @@ local function isInsideLootFolder(instance)
         local name = string.lower(parent.Name)
         if name == "loot" or name == "items" or name == "drops"
             or name == "pickups" or name == "worlditems" or name == "looseitems"
-            or name == "runtimeitems" then
+            or name == "runtimeitems" or name == "item_container" or name == "itemcontainer" then
             return true
         end
         parent = parent.Parent
@@ -3650,11 +3921,33 @@ local function findNamedWorkspaceContainer(containerName, cacheKey, scanKey)
 end
 
 local function getObjectModelsFolder()
+    if game.GameId == 10759337137 then return nil end
     return findNamedWorkspaceContainer("ObjectModels", "cachedObjectModelsFolder", "objectModelsScanAt")
 end
 
 local function getRuntimeItemsFolder()
+    if game.GameId == 10759337137 then return nil end
     return findNamedWorkspaceContainer("RuntimeItems", "cachedRuntimeItemsFolder", "runtimeItemsScanAt")
+end
+
+state.getItemContainerFolder = function()
+    return findNamedWorkspaceContainer("ITEM_CONTAINER", "cachedItemContainer", "itemContainerScanAt")
+end
+
+state.getTopLevelItemContainerObject = function(instance)
+    local container = state.getItemContainerFolder()
+    if not container or not instance then
+        return nil
+    end
+    local current = instance
+    while current and current ~= container do
+        if current.Parent == container
+            and (current:IsA("Model") or current:IsA("Tool") or current:IsA("BasePart")) then
+            return current
+        end
+        current = current.Parent
+    end
+    return nil
 end
 
 local function findServerEntityOwner(object)
@@ -3734,6 +4027,11 @@ local function getLootCandidate(instance)
         candidate = instance:FindFirstAncestorOfClass("Model") or instance
     else
         return nil
+    end
+
+    local itemContainerRoot = state.getTopLevelItemContainerObject(instance)
+    if itemContainerRoot then
+        candidate = itemContainerRoot
     end
 
     if not candidate or not candidate.Parent or not candidate:IsDescendantOf(Workspace)
@@ -4229,6 +4527,9 @@ local function clickWorldObject(root)
 end
 
 state.getDeadRailsLootRemote = function(remoteName)
+    if game.GameId == 10759337137 then
+        return nil
+    end
     local cached = state.cachedDeadRailsLootRemotes[remoteName]
     if cached and cached.Parent then
         return cached
@@ -4320,6 +4621,14 @@ state.tryDeadRailsRuntimeToolPickup = function(object)
 end
 
 local function storeAllRuntimeItems()
+    if game.GameId == 10759337137 then
+        local lastStopStore = state.getLastStopServiceRemote("ItemService", "RF", "StoreItem")
+        if lastStopStore and lastStopStore:IsA("RemoteFunction") then
+            return false, "Last Stop StoreItem found; arguments not verified, not invoked"
+        end
+        return false, "Last Stop ItemService.StoreItem not found"
+    end
+
     local runtimeItems = getRuntimeItemsFolder()
     if not runtimeItems then
         return false, "RuntimeItems folder not found"
@@ -4384,7 +4693,9 @@ state.tryDeadRailsServerPickup = function(object)
         end
         state.currentLootApi = "ObjectModels." .. remoteName .. " (attempt " .. attempt .. "/3)"
         task.wait(0.12)
+        local itemContainer = state.getItemContainerFolder()
         if not object.Parent or isPlayerInventoryObject(object)
+            or (itemContainer and not object:IsDescendantOf(itemContainer))
             or getInventoryItemCount() > beforeCount then
             state.currentLootApi = "ObjectModels." .. remoteName .. " (confirmed)"
             return true
@@ -4399,8 +4710,8 @@ local function collectLootObject(object, root, prompt, clickDetector)
         return false
     end
 
-    -- Prefer the Dead Rails-style serverEntity pickup only when the exact
-    -- ObjectModels + RemoteEvent structure is present. Otherwise use normal input.
+    -- Last Stop's ITEM_CONTAINER uses the visible click-to-grab action. The
+    -- Dead Rails serverEntity adapters are gated off for this universe.
     if state.tryDeadRailsServerPickup(object) then
         return true
     end
@@ -4455,6 +4766,62 @@ local function collectLootObject(object, root, prompt, clickDetector)
     return attempted or clicked
 end
 
+state.summarizeObservedPayload = function(...)
+    local values = {}
+    for index = 1, math.min(select("#", ...), 8) do
+        local value = select(index, ...)
+        local kind = typeof(value)
+        local summary
+        if kind == "Instance" then
+            local ok, fullName = pcall(function() return value:GetFullName() end)
+            summary = ok and (value.ClassName .. ":" .. fullName) or value.ClassName
+        elseif type(value) == "table" then
+            local keys = {}
+            local count = 0
+            for key, item in pairs(value) do
+                table.insert(keys, tostring(key) .. "=" .. type(item))
+                count = count + 1
+                if count >= 8 then break end
+            end
+            summary = "table{" .. table.concat(keys, ",") .. "}"
+        else
+            summary = tostring(value)
+        end
+        table.insert(values, tostring(index) .. ":" .. kind .. "=" .. tostring(summary):sub(1, 110))
+    end
+    return #values > 0 and table.concat(values, " | ") or "(no arguments)"
+end
+
+state.getLastStopServiceRemote = function(serviceName, groupName, remoteName)
+    local clientSource = state.replicatedStorage:FindFirstChild("ClientSource")
+    local mutual = clientSource and clientSource:FindFirstChild("Mutual")
+    local packages = mutual and mutual:FindFirstChild("Packages")
+    local knit = packages and packages:FindFirstChild("Knit")
+    local services = knit and knit:FindFirstChild("Services")
+    local service = services and services:FindFirstChild(serviceName)
+    local group = service and service:FindFirstChild(groupName)
+    return group and group:FindFirstChild(remoteName) or nil
+end
+
+state.connectLastStopTelemetry = function(serviceName, groupName, remoteName, stateKey)
+    local clientSource = state.replicatedStorage:FindFirstChild("ClientSource")
+    local mutual = clientSource and clientSource:FindFirstChild("Mutual")
+    local packages = mutual and mutual:FindFirstChild("Packages")
+    local knit = packages and packages:FindFirstChild("Knit")
+    local services = knit and knit:FindFirstChild("Services")
+    local service = services and services:FindFirstChild(serviceName)
+    local group = service and service:FindFirstChild(groupName)
+    local remote = group and group:FindFirstChild(remoteName)
+    if remote and remote:IsA("RemoteEvent") then
+        track(remote.OnClientEvent:Connect(function(...)
+            state[stateKey] = state.summarizeObservedPayload(...)
+        end))
+    end
+end
+
+state.connectLastStopTelemetry("DamageService", "RE", "DamageDealt", "lastDamageEventSummary")
+state.connectLastStopTelemetry("ProjectileService", "RE", "ProjectileHit", "lastProjectileEventSummary")
+
 local function buildRuntimeDiagnostics()
     local lines = {}
     local function add(value)
@@ -4473,8 +4840,9 @@ local function buildRuntimeDiagnostics()
         end
     end
 
-    add("LAST STOP TOOLKIT DIAGNOSTICS / V10.2")
+    add("LAST STOP TOOLKIT DIAGNOSTICS / V10.3")
     add("PlaceId=" .. tostring(game.PlaceId) .. " GameId=" .. tostring(game.GameId))
+    add("Last Stop universe match=" .. tostring(game.GameId == 10759337137))
     add("JobId=" .. tostring(game.JobId))
     add("Melee state=" .. tostring(state.killAura) .. " API=" .. tostring(state.currentAuraApi))
     add("Loot state=" .. tostring(state.autoLoot) .. " API=" .. tostring(state.currentLootApi))
@@ -4486,7 +4854,7 @@ local function buildRuntimeDiagnostics()
     if character then
         for _, child in ipairs(character:GetChildren()) do
             if child:IsA("Tool") then
-                add("  Character/" .. child.Name
+                add("  Character/" .. child.Name .. " | Identity=" .. state.getItemIdentityText(child)
                     .. " | MeleeConfig=" .. tostring(child:FindFirstChild("MeleeWeaponConfiguration", true) ~= nil)
                     .. " | SwingEvent=" .. tostring(child:FindFirstChild("SwingEvent", true) ~= nil))
             end
@@ -4495,7 +4863,7 @@ local function buildRuntimeDiagnostics()
     if backpack then
         for _, child in ipairs(backpack:GetChildren()) do
             if child:IsA("Tool") then
-                add("  Backpack/" .. child.Name
+                add("  Backpack/" .. child.Name .. " | Identity=" .. state.getItemIdentityText(child)
                     .. " | MeleeConfig=" .. tostring(child:FindFirstChild("MeleeWeaponConfiguration", true) ~= nil)
                     .. " | SwingEvent=" .. tostring(child:FindFirstChild("SwingEvent", true) ~= nil))
             end
@@ -4507,7 +4875,7 @@ local function buildRuntimeDiagnostics()
     for _, object in ipairs(state.replicatedStorage:GetDescendants()) do
         if object:IsA("RemoteEvent") or object:IsA("RemoteFunction") then
             local lower = string.lower(object.Name)
-            if hasAny(lower, {"swing", "melee", "attack", "hit", "damage", "shoot", "fire", "reload", "pickup", "drop", "action", "store", "loot", "interact", "weapon"}) then
+            if hasAny(lower, {"swing", "melee", "attack", "hit", "damage", "shoot", "fire", "reload", "pickup", "drop", "action", "store", "loot", "interact", "weapon", "entity", "npc", "health", "state", "death", "died", "spawn", "collect", "grab", "equip", "inventory", "projectile", "item"}) then
                 add("  " .. object.ClassName .. " " .. object:GetFullName())
                 remoteCount = remoteCount + 1
                 if remoteCount >= 100 then break end
@@ -4521,8 +4889,61 @@ local function buildRuntimeDiagnostics()
         add("  " .. child.Name .. " | " .. child.ClassName)
         if index >= 60 then break end
     end
-    addContainerSample("ObjectModels", getObjectModelsFolder())
-    addContainerSample("RuntimeItems", getRuntimeItemsFolder())
+    addContainerSample("ObjectModels (Dead Rails reference)", getObjectModelsFolder())
+    addContainerSample("RuntimeItems (Dead Rails reference)", getRuntimeItemsFolder())
+    addContainerSample("ITEM_CONTAINER (Last Stop)", state.getItemContainerFolder())
+
+    local entityContainer = state.getLastStopEntityContainer()
+    add("ENTITY_CONTAINER (Last Stop): " .. (entityContainer and entityContainer:GetFullName() or "not found"))
+    if entityContainer then
+        local shownEntities = 0
+        for _, entity in ipairs(entityContainer:GetChildren()) do
+            if entity:IsA("Model") then
+                local motors, ballSockets, animators, tracks = state.getEntityRigEvidence(entity)
+                local root = getRootPart(entity)
+                local context = state.getLastStopEntityContext(entity)
+                local labels = {}
+                for _, word in ipairs({"guard", "vampire", "zombie", "bandit", "skeleton", "fred", "anubis", "dracula", "boss", "corpse", "ragdoll"}) do
+                    if hasAny(context, {word}) then table.insert(labels, word) end
+                end
+                add(string.format("  %s | root=%s | parts=%d | Motor6D=%d | BallSocket=%d | Animator=%d | Tracks=%d | labels=%s",
+                    entity.Name, root and root.Name or "nil", #entity:GetDescendants(), motors, ballSockets,
+                    animators, tracks, table.concat(labels, ",")))
+                shownEntities = shownEntities + 1
+                if shownEntities >= 20 then break end
+            end
+        end
+        if shownEntities == 0 then add("  no direct Model children") end
+    end
+
+    local clientSource = state.replicatedStorage:FindFirstChild("ClientSource")
+    local mutual = clientSource and clientSource:FindFirstChild("Mutual")
+    local packages = mutual and mutual:FindFirstChild("Packages")
+    local knit = packages and packages:FindFirstChild("Knit")
+    local services = knit and knit:FindFirstChild("Services")
+    add("Last Stop Knit services: " .. (services and services:GetFullName() or "not found"))
+    if services then
+        local serviceCount = 0
+        for _, service in ipairs(services:GetChildren()) do
+            local re = service:FindFirstChild("RE")
+            local rf = service:FindFirstChild("RF")
+            if re or rf then
+                local names = {}
+                for _, group in ipairs({re, rf}) do
+                    if group then
+                        for _, remote in ipairs(group:GetChildren()) do
+                            table.insert(names, group.Name .. "." .. remote.Name .. "(" .. remote.ClassName .. ")")
+                        end
+                    end
+                end
+                add("  " .. service.Name .. " | " .. table.concat(names, ", "))
+                serviceCount = serviceCount + 1
+                if serviceCount >= 40 then break end
+            end
+        end
+    end
+    add("Observed DamageDealt payload: " .. tostring(state.lastDamageEventSummary))
+    add("Observed ProjectileHit payload: " .. tostring(state.lastProjectileEventSummary))
 
     add("Pickup prompts:")
     local promptCount = 0
@@ -4543,8 +4964,10 @@ local function buildRuntimeDiagnostics()
             local entityName = model:GetAttribute("EntityName")
             local bounty = model:GetAttribute("Bounty")
             local health = getTargetHealth(model)
-            add(string.format("  %s | kind=%s | EntityName=%s | Bounty=%s | health=%s",
-                model:GetFullName(), tostring(kind), tostring(entityName), tostring(bounty), tostring(health)))
+            local motors, ballSockets, animators, tracks = state.getEntityRigEvidence(model)
+            add(string.format("  %s | kind=%s | EntityName=%s | Bounty=%s | health=%s | Motor6D=%d | BallSocket=%d | Animator=%d | Tracks=%d",
+                model:GetFullName(), tostring(kind), tostring(entityName), tostring(bounty), tostring(health),
+                motors, ballSockets, animators, tracks))
             npcCount = npcCount + 1
             if npcCount >= 30 then break end
         end
@@ -4648,6 +5071,7 @@ local function runAutoLoot()
                 return
             end
 
+            state.currentLootApi = "Last Stop ITEM_CONTAINER / click-to-grab"
             local character = LocalPlayer.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -4683,17 +5107,20 @@ local function runAutoLoot()
 
             if target and targetRoot then
                 lootCurrentTarget = target.Name
+                state.currentLootApi = "Last Stop ITEM_CONTAINER / click-to-grab"
                 local pickupRange = getLootPickupRange(prompt, clickDetector)
 
-                -- Dead Rails-style ObjectModels/RuntimeItems remotes can collect
-                -- nearby objects without teleporting to each one. Only attempt
-                -- them inside their reference interaction radius.
+                -- Dead Rails remote adapters are intentionally disabled in the
+                -- Last Stop universe. They remain only as optional references for
+                -- other games; Last Stop uses ITEM_CONTAINER click-to-grab input.
                 local directCollected = false
-                if distance <= 30 then
-                    directCollected = state.tryDeadRailsServerPickup(target)
-                end
-                if not directCollected and distance <= 10 then
-                    directCollected = state.tryDeadRailsRuntimeToolPickup(target)
+                if game.GameId ~= 10759337137 then
+                    if distance <= 30 then
+                        directCollected = state.tryDeadRailsServerPickup(target)
+                    end
+                    if not directCollected and distance <= 10 then
+                        directCollected = state.tryDeadRailsRuntimeToolPickup(target)
+                    end
                 end
                 if directCollected or not target.Parent then
                     lootCollected = lootCollected + 1
@@ -4742,7 +5169,9 @@ local function runAutoLoot()
 
                     local afterCount = getInventoryItemCount()
                     local movedToInventory = isPlayerInventoryObject(target)
-                    local collected = not target.Parent or movedToInventory or afterCount > beforeCount
+                    local itemContainer = state.getItemContainerFolder()
+                    local movedOutOfWorldItems = itemContainer and not target:IsDescendantOf(itemContainer)
+                    local collected = not target.Parent or movedToInventory or movedOutOfWorldItems or afterCount > beforeCount
                     if collected then
                         lootCollected = lootCollected + 1
                         lootCollectedSinceReturn = lootCollectedSinceReturn + 1
@@ -4779,6 +5208,7 @@ local function runAutoLoot()
 
             elseif lootCoolingDown and not shouldReturn then
                 lootStatus = "Waiting for pickup retry"
+                state.currentLootApi = "ITEM_CONTAINER scanned; waiting for retry"
                 task.wait(0.2)
 
             elseif state.autoReturnBus and shouldReturn then
@@ -4819,7 +5249,8 @@ local function runAutoLoot()
                     task.wait(0.8)
                 end
             else
-                lootStatus = "No loot in radius"
+                lootStatus = "No eligible item in ITEM_CONTAINER radius"
+                state.currentLootApi = string.format("ITEM_CONTAINER scanned; candidates=%d", lootCandidateCount)
                 lootCurrentTarget = "--"
                 task.wait(0.45)
             end
